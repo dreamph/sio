@@ -57,11 +57,7 @@ if err != nil {
 }
 defer output.Cleanup()
 
-data, err := output.Bytes()
-if err != nil {
-	log.Fatalf("output.Bytes: %v", err)
-}
-fmt.Printf("processed %d bytes\n", len(data))
+fmt.Printf("output file: %s\n", output.Path())
 ```
 
 API Overview
