@@ -1,6 +1,7 @@
 package sio
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -1131,4 +1132,35 @@ func CopyOutputTo(out *Output, w io.Writer) (int64, error) {
 	defer sr.Cleanup()
 
 	return io.Copy(w, rc)
+}
+
+type LineFn func(line string) error
+
+func ReadLines(ctx context.Context, src StreamReader, fn LineFn) error {
+	if src == nil {
+		return ErrNilSource
+	}
+	if fn == nil {
+		return nil
+	}
+
+	return Read(ctx, src, func(ctx context.Context, r io.Reader) error {
+		scanner := bufio.NewScanner(r)
+
+		buf := make([]byte, 0, 64*1024) // 64KB
+		scanner.Buffer(buf, 1024*1024)  // max 1MB
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if err := fn(line); err != nil {
+				return err
+			}
+		}
+		return scanner.Err()
+	})
+}
+
+func ReadFileLines(ctx context.Context, path string, fn LineFn) error {
+	src := NewFileReader(path)
+	return ReadLines(ctx, src, fn)
 }
