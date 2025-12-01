@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -17,37 +16,43 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-func newServerApp(ioManager sio.Manager) (*fiber.App, error) {
+func newServerApp(ioManager sio.IoManager) (*fiber.App, error) {
 	app := fiber.New(fiber.Config{
 		BodyLimit: 1000 * 1024 * 1024,
 	})
 
-	app.Post("/process-by-io", func(c *fiber.Ctx) error {
+	app.Post("/process", func(c *fiber.Ctx) error {
 		fileHeader, err := c.FormFile("file")
 		if err != nil {
 			return fiber.NewError(fiber.StatusBadRequest, "missing multipart form field : file")
 		}
-
-		in := sio.NewMultipartReader(fileHeader)
 
 		outputExt := filepath.Ext(fileHeader.Filename)
 		if outputExt == "" {
 			outputExt = ".bin"
 		}
 
-		result, err := sio.Process(c.UserContext(), in, outputExt, func(ctx context.Context, r io.Reader, w io.Writer) error {
+		ses, err := ioManager.NewSession()
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		defer ses.Cleanup()
+
+		ctx := sio.WithSession(c.UserContext(), ses)
+
+		in := sio.NewMultipartReader(fileHeader)
+		output, err := sio.Process(ctx, in, outputExt, func(ctx context.Context, r io.Reader, w io.Writer) error {
 			_, err := io.Copy(w, r)
 			return err
 		})
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("process failed: %v", err))
 		}
-		result = result.Keep()
 
 		c.Type("application/octet-stream")
 		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", "processed"+outputExt))
 
-		readerCloser, err := sio.NewDownloadReaderCloser(result.AsStreamReader())
+		readerCloser, err := sio.NewDownloadReaderCloser(output.Reader())
 		if err != nil {
 			return err
 		}
@@ -55,36 +60,11 @@ func newServerApp(ioManager sio.Manager) (*fiber.App, error) {
 		return c.SendStream(readerCloser)
 	})
 
-	app.Post("/process-by-bytes", func(c *fiber.Ctx) error {
-		fileHeader, err := c.FormFile("file")
-		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "missing multipart form field \"file\"")
-		}
-
-		file, err := fileHeader.Open()
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("open upload failed: %v", err))
-		}
-		defer file.Close()
-
-		data, err := io.ReadAll(file)
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("read upload failed: %v", err))
-		}
-
-		var out bytes.Buffer
-		out.Write(data)
-
-		c.Type("application/octet-stream")
-		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", fileHeader.Filename))
-		return c.Send(out.Bytes())
-	})
-
 	return app, nil
 }
 
 func main() {
-	ioManager, err := sio.NewManager("./temp-files")
+	ioManager, err := sio.NewIoManager("./temp-files")
 	if err != nil {
 		log.Fatal(err)
 	}

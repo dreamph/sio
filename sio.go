@@ -3,6 +3,7 @@ package sio
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -21,18 +22,29 @@ import (
 /* ---------- Errors ---------- */
 
 var (
-	ErrNilSource      = errors.New("sio: nil source")
-	ErrOpenFailed     = errors.New("sio: cannot open reader")
-	ErrManagerClosed  = errors.New("sio: manager is closed")
-	ErrSessionClosed  = errors.New("sio: session is closed")
-	ErrInvalidURL     = errors.New("sio: invalid URL")
-	ErrDownloadFailed = errors.New("sio: download failed")
+	ErrNilSource       = errors.New("sio: nil source")
+	ErrOpenFailed      = errors.New("sio: cannot open reader")
+	ErrIoManagerClosed = errors.New("sio: manager is closed")
+	ErrIoSessionClosed = errors.New("sio: session is closed")
+	ErrInvalidURL      = errors.New("sio: invalid URL")
+	ErrDownloadFailed  = errors.New("sio: download failed")
+	ErrNoSession       = errors.New("sio: session is nil")
 )
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = &http.Client{Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			//InsecureSkipVerify: true,
+		},
+	},
+}
+
+func SetHttpClient(c *http.Client) {
+	httpClient = c
+}
 
 /* -------------------------------------------------------------------------- */
-/*                           StreamReader Abstraction                           */
+/*                           StreamReader Abstraction                          */
 /* -------------------------------------------------------------------------- */
 
 // StreamReader represents any input source that can be opened as an io.ReadCloser,
@@ -56,7 +68,9 @@ type FileReader struct {
 func NewFileReader(path string) *FileReader { return &FileReader{Path: path} }
 
 func (f *FileReader) Open() (io.ReadCloser, error) { return os.Open(f.Path) }
-func (f *FileReader) Cleanup() error               { return nil }
+func (f *FileReader) Cleanup() error {
+	return nil
+}
 
 /* -------------------------------------------------------------------------- */
 /*                             MultipartReader                                 */
@@ -74,6 +88,34 @@ func NewMultipartReader(fh *multipart.FileHeader) *MultipartReader {
 
 func (m *MultipartReader) Open() (io.ReadCloser, error) { return m.File.Open() }
 func (m *MultipartReader) Cleanup() error               { return nil }
+
+/* -------------------------------------------------------------------------- */
+/*                                 IOReader                                    */
+/* -------------------------------------------------------------------------- */
+
+// IOReader wraps an uploaded io.Reader.
+// Cleanup() does nothing because frameworks handle their own temp files.
+type IOReader struct {
+	File io.Reader
+}
+
+func NewIOReader(r io.Reader) *IOReader {
+	return &IOReader{File: r}
+}
+
+func (m *IOReader) Open() (io.ReadCloser, error) {
+	if m.File == nil {
+		return nil, fmt.Errorf("sio: IOReader: underlying reader is nil")
+	}
+
+	if rc, ok := m.File.(io.ReadCloser); ok {
+		return rc, nil
+	}
+
+	return io.NopCloser(m.File), nil
+}
+
+func (m *IOReader) Cleanup() error { return nil }
 
 /* -------------------------------------------------------------------------- */
 /*                                BytesReader                                  */
@@ -102,80 +144,49 @@ func (b *BytesReader) Cleanup() error {
 /*                                 URLReader                                   */
 /* -------------------------------------------------------------------------- */
 
-// URLReader lazily downloads the content from a URL into a temporary file.
-// The temp file is deleted by Cleanup().
+// URLReader streams content directly from a URL.
+// Each Open() call creates a new HTTP request.
+// Cleanup() is a no-op since the response body is closed via the returned ReadCloser.
 type URLReader struct {
 	URL string
-	tmp string
 }
 
 func NewURLReader(urlStr string) *URLReader { return &URLReader{URL: urlStr} }
 
 func (u *URLReader) Open() (io.ReadCloser, error) {
-	if u.tmp == "" {
-		if err := u.download(); err != nil {
-			return nil, err
-		}
-	}
-	return os.Open(u.tmp)
-}
-
-func (u *URLReader) download() error {
 	parsed, err := url.Parse(u.URL)
 	if err != nil {
-		return ErrInvalidURL
+		return nil, ErrInvalidURL
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return ErrInvalidURL
+		return nil, ErrInvalidURL
 	}
 
 	resp, err := httpClient.Get(u.URL)
 	if err != nil {
-		return ErrDownloadFailed
+		return nil, ErrDownloadFailed
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ErrDownloadFailed
+		resp.Body.Close()
+		return nil, ErrDownloadFailed
 	}
 
-	tmpFile, err := os.CreateTemp("", "sio-url-*")
-	if err != nil {
-		return err
-	}
-	defer tmpFile.Close()
-
-	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
-		_ = os.Remove(tmpFile.Name())
-		return err
-	}
-
-	u.tmp = tmpFile.Name()
-	return nil
+	return resp.Body, nil
 }
 
-func (u *URLReader) Cleanup() error {
-	if u.tmp == "" {
-		return nil
-	}
-	err := os.Remove(u.tmp)
-	u.tmp = ""
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
-}
+func (u *URLReader) Cleanup() error { return nil }
 
 /* -------------------------------------------------------------------------- */
 /*                               Manager                                       */
 /* -------------------------------------------------------------------------- */
 
-type Manager interface {
-	NewSession() (Session, error)
+type IoManager interface {
+	NewSession() (IoSession, error)
 	Cleanup() error
 }
 
-// Manager manages a root directory under which multiple Sessions
+// IoManager manages a root directory under which multiple IoSessions
 // create their own isolated working directories.
 type manager struct {
 	mu      sync.Mutex
@@ -183,10 +194,10 @@ type manager struct {
 	closed  bool
 }
 
-// NewManager :
+// NewIoManager :
 //   - baseDir == "" → create a temp folder using os.MkdirTemp("", "sio-")
 //   - baseDir != "" → create/use the provided directory
-func NewManager(baseDir string) (Manager, error) {
+func NewIoManager(baseDir string) (IoManager, error) {
 	if strings.TrimSpace(baseDir) == "" {
 		dir, err := os.MkdirTemp("", "sio-")
 		if err != nil {
@@ -203,20 +214,20 @@ func NewManager(baseDir string) (Manager, error) {
 	return &manager{baseDir: baseDir}, nil
 }
 
-// BaseDir returns the underlying root directory managed by this Manager.
+// BaseDir returns the underlying root directory managed by this IoManager.
 func (m *manager) BaseDir() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.baseDir
 }
 
-// NewSession creates a new isolated Session under baseDir.
-func (m *manager) NewSession() (Session, error) {
+// NewSession creates a new isolated IoSession under baseDir.
+func (m *manager) NewSession() (IoSession, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.closed {
-		return nil, ErrManagerClosed
+		return nil, ErrIoManagerClosed
 	}
 
 	id := uuid.New().String()
@@ -225,7 +236,7 @@ func (m *manager) NewSession() (Session, error) {
 		return nil, err
 	}
 
-	return &session{manager: m, dir: dir}, nil
+	return &ioSession{manager: m, dir: dir}, nil
 }
 
 // Cleanup removes the entire baseDir. Use only during app shutdown.
@@ -246,43 +257,52 @@ func (m *manager) Cleanup() error {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                Session                                      */
+/*                                IoSession                                      */
 /* -------------------------------------------------------------------------- */
 
-type Session interface {
-	Process(ctx context.Context, src StreamReader, outExt string, fn func(ctx context.Context, r io.Reader, w io.Writer) error) (*Output, error)
-	Read(ctx context.Context, src StreamReader, fn func(ctx context.Context, r io.Reader) error) error
+type ReadFunc func(ctx context.Context, r io.Reader) error
+type ReadListFunc func(ctx context.Context, readers []io.Reader) error
+type ProcessFunc func(ctx context.Context, r io.Reader, w io.Writer) error
+type ProcessListFunc func(ctx context.Context, readers []io.Reader, w io.Writer) error
+
+type IoSession interface {
+	Read(ctx context.Context, source StreamReader, fn ReadFunc) error
+	ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) error
+
+	Process(ctx context.Context, source StreamReader, outExt string, fn ProcessFunc) (*Output, error)
+	ProcessList(ctx context.Context, sources []StreamReader, outExt string, fn ProcessListFunc) (*Output, error)
+
 	Cleanup() error
 }
 
 // session represents an isolated working directory where all temporary files
 // and transformation outputs are stored during a single job or request.
-type session struct {
+type ioSession struct {
 	mu      sync.Mutex
-	manager Manager
+	manager IoManager
 	dir     string
 	closed  bool
 	outputs []*Output // tracked outputs inside this session
 }
 
-// Dir returns the directory assigned to this Session.
-func (s *session) Dir() string {
+// Dir returns the directory assigned to this IoIoSession.
+func (s *ioSession) Dir() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dir
 }
 
-func (s *session) ensureOpen() error {
+func (s *ioSession) ensureOpen() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return ErrSessionClosed
+		return ErrIoSessionClosed
 	}
 	return nil
 }
 
 // newOutput creates a new temporary file inside the session directory and tracks it.
-func (s *session) newOutput(ext string) (*Output, error) {
+func (s *ioSession) newOutput(ext string) (*Output, error) {
 	if err := s.ensureOpen(); err != nil {
 		return nil, err
 	}
@@ -307,34 +327,34 @@ func (s *session) newOutput(ext string) (*Output, error) {
 }
 
 // Process executes a transformation:
-//  1. Open src (r)
+//  1. Open source (r)
 //  2. Create Output (w)
 //  3. Run fn(ctx, r, w)
 //
-// Returns the Output on success.
-func (s *session) Process(
+// Returns an Output on success.
+func (s *ioSession) Process(
 	ctx context.Context,
-	src StreamReader,
+	source StreamReader,
 	outExt string,
-	fn func(ctx context.Context, r io.Reader, w io.Writer) error,
+	fn ProcessFunc,
 ) (*Output, error) {
 
-	if src == nil {
+	if source == nil {
 		return nil, ErrNilSource
 	}
 	if fn == nil {
-		return nil, fmt.Errorf("sio: Session: fn is nil")
+		return nil, fmt.Errorf("sio: IoSession: fn is nil")
 	}
 	if err := s.ensureOpen(); err != nil {
 		return nil, err
 	}
 
-	r, err := src.Open()
+	r, err := source.Open()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrOpenFailed, err)
 	}
 	defer r.Close()
-	defer src.Cleanup()
+	defer source.Cleanup()
 
 	out, err := s.newOutput(outExt)
 	if err != nil {
@@ -343,13 +363,58 @@ func (s *session) Process(
 
 	w, err := out.OpenWriter()
 	if err != nil {
-		out.Cleanup()
+		_ = out.cleanup()
 		return nil, err
 	}
 	defer w.Close()
 
 	if err := fn(ctx, r, w); err != nil {
-		out.Cleanup()
+		_ = out.cleanup()
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// ProcessList opens all sources, passes the readers to fn along with a writer,
+// and returns an Output on success.
+func (s *ioSession) ProcessList(
+	ctx context.Context,
+	sources []StreamReader,
+	outExt string,
+	fn ProcessListFunc,
+) (*Output, error) {
+
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("sio: empty source list")
+	}
+	if fn == nil {
+		return nil, fmt.Errorf("sio: ProcessReaderList: fn is nil")
+	}
+	if err := s.ensureOpen(); err != nil {
+		return nil, err
+	}
+
+	rl, err := OpenReaderList(sources)
+	if err != nil {
+		return nil, err
+	}
+	defer rl.Close()
+
+	out, err := s.newOutput(outExt)
+	if err != nil {
+		return nil, err
+	}
+
+	w, err := out.OpenWriter()
+	if err != nil {
+		_ = out.cleanup()
+		return nil, err
+	}
+	defer w.Close()
+
+	if err := fn(ctx, rl.Readers, w); err != nil {
+		_ = out.cleanup()
 		return nil, err
 	}
 
@@ -358,13 +423,13 @@ func (s *session) Process(
 
 // Read simply opens the StreamReader and passes it to fn.
 // No Output file is created.
-func (s *session) Read(
+func (s *ioSession) Read(
 	ctx context.Context,
-	src StreamReader,
-	fn func(ctx context.Context, r io.Reader) error,
+	source StreamReader,
+	fn ReadFunc,
 ) error {
 
-	if src == nil {
+	if source == nil {
 		return ErrNilSource
 	}
 	if fn == nil {
@@ -374,20 +439,41 @@ func (s *session) Read(
 		return err
 	}
 
-	r, err := src.Open()
+	r, err := source.Open()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrOpenFailed, err)
 	}
 	defer r.Close()
-	defer src.Cleanup()
+	defer source.Cleanup()
 
 	return fn(ctx, r)
 }
 
-/* ---------- Session Cleanup Handling ---------- */
+func (s *ioSession) ReadList(
+	ctx context.Context,
+	sources []StreamReader,
+	fn ReadListFunc,
+) error {
+	if len(sources) == 0 {
+		return ErrNilSource
+	}
+	if fn == nil {
+		return fmt.Errorf("sio: ReadList: fn is nil")
+	}
+
+	rl, err := OpenReaderList(sources)
+	if err != nil {
+		return err
+	}
+	defer rl.Close()
+
+	return fn(ctx, rl.Readers)
+}
+
+/* ---------- IoSession Cleanup Handling ---------- */
 
 // isKeptPath returns true if the given path belongs to an Output marked as kept.
-func (s *session) isKeptPath(path string) bool {
+func (s *ioSession) isKeptPath(path string) bool {
 	for _, o := range s.outputs {
 		o.mu.Lock()
 		kept := o.keep && !o.closed && o.path == path
@@ -400,9 +486,9 @@ func (s *session) isKeptPath(path string) bool {
 }
 
 // Cleanup removes all non-kept files inside the session directory.
-// Kept files survive Session.Cleanup().
+// Kept files survive IoSession.Cleanup().
 // The directory itself is removed if empty.
-func (s *session) Cleanup() error {
+func (s *ioSession) Cleanup() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -438,14 +524,15 @@ func (s *session) Cleanup() error {
 /*                                  Output                                     */
 /* -------------------------------------------------------------------------- */
 
-// Output represents a file produced by a Session.Process call.
+// Output represents a file produced by a IoSession.Process call.
 // It can be kept beyond session cleanup via Output.Keep().
 type Output struct {
-	mu     sync.Mutex
-	path   string
-	ses    Session
-	closed bool
-	keep   bool
+	mu           sync.Mutex
+	path         string
+	ses          IoSession
+	closed       bool
+	keep         bool
+	detachedPath string // file copied outside the session dir (for detached use)
 }
 
 func (o *Output) Path() string {
@@ -474,11 +561,16 @@ func (o *Output) OpenWriter() (io.WriteCloser, error) {
 	return os.Create(o.path)
 }
 
-func (o *Output) AsStreamReader() StreamReader {
-	return NewFileReader(o.Path())
+func (o *Output) Reader(opts ...InOption) StreamReader {
+	sr := NewFileReader(o.Path())
+	if len(opts) > 0 {
+		return In(sr, opts...)
+	}
+	return sr
 }
 
-func (o *Output) Cleanup() error {
+// cleanup is an internal helper that removes the output file and any detached file.
+func (o *Output) cleanup() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -487,16 +579,26 @@ func (o *Output) Cleanup() error {
 	}
 	o.closed = true
 
-	err := os.Remove(o.path)
-	if os.IsNotExist(err) {
-		return nil
+	var errs error
+
+	// Remove the file inside the session.
+	if err := os.Remove(o.path); err != nil && !os.IsNotExist(err) {
+		errs = errors.Join(errs, err)
 	}
-	return err
+
+	// Remove the detached file (if any).
+	if o.detachedPath != "" {
+		if err := os.Remove(o.detachedPath); err != nil && !os.IsNotExist(err) {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	return errs
 }
 
 // Keep marks the output file as persistent.
-// Session.Cleanup() will NOT delete the file.
-// This file will survive until Output.Cleanup() or Manager.Cleanup().
+// IoSession.Cleanup() will NOT delete the file.
+// This file will survive until process exit or manual deletion.
 func (o *Output) Keep() *Output {
 	o.mu.Lock()
 	o.keep = true
@@ -539,129 +641,115 @@ func (o *Output) Bytes() ([]byte, error) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                       Global Default Manager Support                        */
+/*                                In helpers                                   */
 /* -------------------------------------------------------------------------- */
 
-var (
-	defaultMgrMu sync.Mutex
-	defaultMgr   Manager
-)
-
-func useDefaultManager() (Manager, error) {
-	defaultMgrMu.Lock()
-	defer defaultMgrMu.Unlock()
-
-	if defaultMgr != nil {
-		return defaultMgr, nil
-	}
-
-	m, err := NewManager("")
-	if err != nil {
-		return nil, err
-	}
-
-	defaultMgr = m
-	return m, nil
+// inConfig holds options passed via In(...).
+type inConfig struct {
+	deleteAfterProcess bool
 }
 
-// InitManager configures the global default Manager with the given baseDir.
-// Usually called once at application startup.
-func InitManager(baseDir string) (Manager, error) {
-	defaultMgrMu.Lock()
-	defer defaultMgrMu.Unlock()
+// InOption is a functional option for In(...).
+type InOption func(*inConfig)
 
-	if defaultMgr != nil {
-		return defaultMgr, nil
+// DeleteAfterUse tells In(...) to delete the underlying file after
+// the StreamReader is cleaned up (only works for *FileReader).
+func DeleteAfterUse() InOption {
+	return func(c *inConfig) {
+		c.deleteAfterProcess = true
 	}
-
-	m, err := NewManager(baseDir)
-	if err != nil {
-		return nil, err
-	}
-
-	defaultMgr = m
-	return m, nil
 }
 
-// ShutdownDefault removes the entire baseDir of the global Manager.
-func ShutdownDefault() error {
-	defaultMgrMu.Lock()
-	defer defaultMgrMu.Unlock()
+// streamReaderWithCleanup wraps an existing StreamReader and injects
+// extra cleanup behavior (e.g. deleting a temp file) before delegating
+// to the inner StreamReader's Cleanup().
+type streamReaderWithCleanup struct {
+	inner        StreamReader
+	extraCleanup func() error
+}
 
-	if defaultMgr == nil {
+func (w *streamReaderWithCleanup) Open() (io.ReadCloser, error) {
+	return w.inner.Open()
+}
+
+func (w *streamReaderWithCleanup) Cleanup() error {
+	var errs error
+
+	if w.extraCleanup != nil {
+		if err := w.extraCleanup(); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	if w.inner != nil {
+		if err := w.inner.Cleanup(); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	return errs
+}
+
+// In wraps a StreamReader with additional behavior, such as DeleteAfterUse.
+//
+// Example:
+//
+//	sr, _ := out.Reader()
+//	out2, _ := ses.Process(ctx, sio2.In(sr, sio2.DeleteAfterUse()), ".pdf", step2)
+func In(sr StreamReader, opts ...InOption) StreamReader {
+	if sr == nil {
 		return nil
 	}
 
-	err := defaultMgr.Cleanup()
-	defaultMgr = nil
-	return err
-}
+	cfg := &inConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
 
-/* -------------------------------------------------------------------------- */
-/*                         Global Read / Process Helpers                       */
-/* -------------------------------------------------------------------------- */
+	// No extra behavior requested → return original.
+	if !cfg.deleteAfterProcess {
+		return sr
+	}
 
-// Read creates a temporary Session, executes Session.Read,
-// then automatically cleans up the Session.
-func Read(
-	ctx context.Context,
-	src StreamReader,
-	fn func(ctx context.Context, r io.Reader) error,
-) error {
+	// Only *FileReader has a concrete path we can delete.
+	fr, ok := sr.(*FileReader)
+	if !ok {
+		return sr
+	}
 
-	m, err := useDefaultManager()
-	if err != nil {
+	path := fr.Path
+
+	extra := func() error {
+		if path == "" {
+			return nil
+		}
+		err := os.Remove(path)
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
 
-	s, err := m.NewSession()
-	if err != nil {
-		return err
+	return &streamReaderWithCleanup{
+		inner:        sr,
+		extraCleanup: extra,
 	}
-	defer s.Cleanup()
-
-	return s.Read(ctx, src, fn)
-}
-
-// Process creates a temporary Session, executes Session.Process,
-// marks the Output as kept, cleans up the Session (removing non-kept files),
-// and returns the final kept Output.
-func Process(ctx context.Context, src StreamReader, outExt string, fn func(ctx context.Context, r io.Reader, w io.Writer) error) (*Output, error) {
-	m, err := useDefaultManager()
-	if err != nil {
-		return nil, err
-	}
-
-	s, err := m.NewSession()
-	if err != nil {
-		return nil, err
-	}
-
-	out, err := s.Process(ctx, src, outExt, fn)
-	if err != nil {
-		s.Cleanup()
-		return nil, err
-	}
-
-	out.Keep()
-	s.Cleanup()
-	return out, nil
 }
 
 /* -------------------------------------------------------------------------- */
 /*                   Utility: Wrap io.Reader as StreamReader                   */
 /* -------------------------------------------------------------------------- */
 
-// NewStreamReaderFromReader loads an io.Reader into memory and returns
-// a BytesReader. This is useful when integrating APIs that expose only
-// io.Reader without access to the underlying file.
-//
-// NOTE: This loads the full content into memory and is not suitable
-// for extremely large streams.
-func NewStreamReaderFromReader(r io.Reader) StreamReader {
-	buf, _ := io.ReadAll(r)
-	return NewBytesReader(buf)
+// NewPartReader wraps multipart.Part as StreamReader (streaming, no buffering).
+func NewPartReader(p *multipart.Part) *IOReader {
+	// *multipart.Part implements io.ReadCloser
+	// ด้วย IOReader.Open() เวอร์ชันใหม่ จะคืน *multipart.Part โดยตรง
+	return NewIOReader(p)
 }
+
+/* -------------------------------------------------------------------------- */
+/*                       DownloadReaderCloser helper                           */
+/* -------------------------------------------------------------------------- */
 
 // DownloadReaderCloser is a convenience interface for a read-only stream
 // that also supports Close, typically used for HTTP response bodies or
@@ -689,7 +777,8 @@ func (d *downloadReaderCloser) Close() error {
 
 	// 1) Close the underlying reader
 	if d.reader != nil {
-		if readerCloseErr := d.reader.Close(); readerCloseErr != nil {
+		readerCloseErr := d.reader.Close()
+		if readerCloseErr != nil {
 			errs = errors.Join(errs, readerCloseErr)
 		}
 		d.reader = nil
@@ -697,7 +786,8 @@ func (d *downloadReaderCloser) Close() error {
 
 	// 2) Cleanup the StreamReader (e.g., remove temp files)
 	if d.streamReader != nil {
-		if streamReaderCleanupErr := d.streamReader.Cleanup(); streamReaderCleanupErr != nil {
+		streamReaderCleanupErr := d.streamReader.Cleanup()
+		if streamReaderCleanupErr != nil {
 			errs = errors.Join(errs, streamReaderCleanupErr)
 		}
 		d.streamReader = nil
@@ -709,9 +799,18 @@ func (d *downloadReaderCloser) Close() error {
 		d.Cleanup = nil
 	}
 
+	if errs != nil {
+		fmt.Println("downloadReaderCloser.Close, Err:", errs)
+	} else {
+		fmt.Println("downloadReaderCloser.Close")
+	}
+
 	return errs
 }
 
+// NewDownloadReaderCloser wraps a StreamReader as a DownloadReaderCloser.
+// When Close() is called, it closes the underlying reader and then calls
+// StreamReader.Cleanup() and the optional extra cleanup function.
 func NewDownloadReaderCloser(streamReader StreamReader, cleanup ...func()) (DownloadReaderCloser, error) {
 	if streamReader == nil {
 		return nil, fmt.Errorf("nil streamReader")
@@ -732,4 +831,285 @@ func NewDownloadReaderCloser(streamReader StreamReader, cleanup ...func()) (Down
 	}
 
 	return closer, nil
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         StreamReader List Utilities                         */
+/* -------------------------------------------------------------------------- */
+
+// ReaderList holds opened readers and provides cleanup functionality.
+type ReaderList struct {
+	Readers []io.Reader
+	closers []io.Closer
+	sources []StreamReader
+}
+
+// Close closes all opened readers and cleans up all source StreamReaders.
+func (rl *ReaderList) Close() error {
+	var errs error
+
+	for _, c := range rl.closers {
+		if err := c.Close(); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	for _, source := range rl.sources {
+		if err := source.Cleanup(); err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	rl.Readers = nil
+	rl.closers = nil
+	rl.sources = nil
+
+	return errs
+}
+
+// OpenReaderList opens all StreamReaders and returns a ReaderList.
+// The caller must call Close() on the returned ReaderList to release resources.
+// If any Open() fails, all previously opened readers are closed and cleaned up.
+func OpenReaderList(sources []StreamReader) (*ReaderList, error) {
+	if len(sources) == 0 {
+		return &ReaderList{}, nil
+	}
+
+	rl := &ReaderList{
+		Readers: make([]io.Reader, 0, len(sources)),
+		closers: make([]io.Closer, 0, len(sources)),
+		sources: make([]StreamReader, 0, len(sources)),
+	}
+
+	for _, source := range sources {
+		if source == nil {
+			rl.Close()
+			return nil, ErrNilSource
+		}
+
+		rc, err := source.Open()
+		if err != nil {
+			rl.Close()
+			return nil, fmt.Errorf("%w: %v", ErrOpenFailed, err)
+		}
+
+		rl.Readers = append(rl.Readers, rc)
+		rl.closers = append(rl.closers, rc)
+		rl.sources = append(rl.sources, source)
+	}
+
+	return rl, nil
+}
+
+type ctxKey struct{}
+
+var sessionKey = ctxKey{}
+
+// WithSession attaches a IoSession into context.
+func WithSession(ctx context.Context, ses IoSession) context.Context {
+	return context.WithValue(ctx, sessionKey, ses)
+}
+
+// Session extracts IoSession from context.
+// Returns nil if not found.
+func Session(ctx context.Context) IoSession {
+	ses, _ := ctx.Value(sessionKey).(IoSession)
+	return ses
+}
+
+// Read is a convenience wrapper that gets IoSession from context
+// and calls ses.Read(...).
+func Read(ctx context.Context, source StreamReader, fn ReadFunc) error {
+	if source == nil {
+		return ErrNilSource
+	}
+	if fn == nil {
+		return fmt.Errorf("sio: Read: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return ErrNoSession
+	}
+
+	return ses.Read(ctx, source, fn)
+}
+
+// ReadList is a convenience wrapper for IoSession.ReadList.
+func ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) error {
+	if len(sources) == 0 {
+		return ErrNilSource
+	}
+	if fn == nil {
+		return fmt.Errorf("sio: ReadList: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return ErrNoSession
+	}
+
+	return ses.ReadList(ctx, sources, fn)
+}
+
+// Process is a convenience wrapper for IoSession.Process.
+func Process(ctx context.Context, source StreamReader, outExt string, fn ProcessFunc) (*Output, error) {
+	if source == nil {
+		return nil, ErrNilSource
+	}
+	if fn == nil {
+		return nil, fmt.Errorf("sio: Process: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return nil, ErrNoSession
+	}
+
+	return ses.Process(ctx, source, outExt, fn)
+}
+
+// ProcessList is a convenience wrapper for IoSession.ProcessList.
+func ProcessList(ctx context.Context, sources []StreamReader, outExt string, fn ProcessListFunc) (*Output, error) {
+	if len(sources) == 0 {
+		return nil, ErrNilSource
+	}
+	if fn == nil {
+		return nil, fmt.Errorf("sio: ProcessList: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return nil, ErrNoSession
+	}
+
+	return ses.ProcessList(ctx, sources, outExt, fn)
+}
+
+func ReadResult[T any](ctx context.Context, source StreamReader, fn func(ctx context.Context, r io.Reader) (*T, error)) (*T, error) {
+	if source == nil {
+		return nil, ErrNilSource
+	}
+	if fn == nil {
+		return nil, fmt.Errorf("sio: ReadWithResult: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return nil, ErrNoSession
+	}
+
+	var result *T
+	err := ses.Read(ctx, source, func(ctx context.Context, r io.Reader) error {
+		res, err := fn(ctx, r)
+		if err != nil {
+			return err
+		}
+
+		result = res
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func ReadListResult[T any](
+	ctx context.Context,
+	sources []StreamReader,
+	fn func(ctx context.Context, readers []io.Reader) (*T, error),
+) (*T, error) {
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("sio: ReadListResult: empty sources")
+	}
+	if fn == nil {
+		return nil, fmt.Errorf("sio: ReadListResult: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return nil, ErrNoSession
+	}
+
+	var result *T
+	err := ses.ReadList(ctx, sources, func(ctx context.Context, readers []io.Reader) error {
+		res, err := fn(ctx, readers)
+		if err != nil {
+			return err
+		}
+		result = res
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func ProcessResult[T any](
+	ctx context.Context,
+	source StreamReader,
+	outExt string,
+	fn func(ctx context.Context, r io.Reader, w io.Writer) (*T, error),
+) (*Output, *T, error) {
+	if source == nil {
+		return nil, nil, ErrNilSource
+	}
+	if fn == nil {
+		return nil, nil, fmt.Errorf("sio: ProcessResult: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return nil, nil, ErrNoSession
+	}
+
+	var result *T
+	out, err := ses.Process(ctx, source, outExt, func(ctx context.Context, r io.Reader, w io.Writer) error {
+		res, err := fn(ctx, r, w)
+		if err != nil {
+			return err
+		}
+		result = res
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, result, nil
+}
+
+func ProcessListResult[T any](
+	ctx context.Context,
+	sources []StreamReader,
+	outExt string,
+	fn func(ctx context.Context, readers []io.Reader, w io.Writer) (*T, error),
+) (*Output, *T, error) {
+	if len(sources) == 0 {
+		return nil, nil, fmt.Errorf("sio: ProcessListResult: empty sources")
+	}
+	if fn == nil {
+		return nil, nil, fmt.Errorf("sio: ProcessListResult: fn is nil")
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return nil, nil, ErrNoSession
+	}
+
+	var result *T
+	out, err := ses.ProcessList(ctx, sources, outExt, func(ctx context.Context, readers []io.Reader, w io.Writer) error {
+		res, err := fn(ctx, readers, w)
+		if err != nil {
+			return err
+		}
+		result = res
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, result, nil
 }
