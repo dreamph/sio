@@ -1113,3 +1113,10 @@ func ProcessListResult[T any](
 	}
 	return out, result, nil
 }
+
+func ToOutput(ctx context.Context, src StreamReader, ext string) (*Output, error) {
+	return Process(ctx, src, ext, func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+}
