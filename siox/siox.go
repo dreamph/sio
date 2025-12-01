@@ -1,0 +1,72 @@
+package siox
+
+import (
+	"context"
+	"io"
+	"mime/multipart"
+
+	"github.com/dreamph/sio"
+)
+
+type DoFn = func(ctx context.Context, r io.Reader, w io.Writer) error
+
+// -----------------------------------------------------------------------------
+// Do: io.Reader → Output
+// -----------------------------------------------------------------------------
+
+func Do(ctx context.Context, r io.Reader, ext string, fn DoFn) (*sio.Output, error) {
+	src := sio.NewIOReader(r)
+	return sio.Process(ctx, src, ext, fn)
+}
+
+// -----------------------------------------------------------------------------
+// Bytes
+// -----------------------------------------------------------------------------
+
+func DoBytes(ctx context.Context, data []byte, ext string, fn DoFn) (*sio.Output, error) {
+	src := sio.NewBytesReader(data)
+	return sio.Process(ctx, src, ext, fn)
+}
+
+// -----------------------------------------------------------------------------
+// File path
+// -----------------------------------------------------------------------------
+
+func DoFile(ctx context.Context, path string, ext string, fn DoFn) (*sio.Output, error) {
+	src := sio.NewFileReader(path)
+	return sio.Process(ctx, src, ext, fn)
+}
+
+// -----------------------------------------------------------------------------
+// multipart.FileHeader
+// -----------------------------------------------------------------------------
+
+func DoMultipart(ctx context.Context, fh *multipart.FileHeader, ext string, fn DoFn) (*sio.Output, error) {
+	src := sio.NewMultipartReader(fh)
+	return sio.Process(ctx, src, ext, fn)
+}
+
+// -----------------------------------------------------------------------------
+// URL
+// -----------------------------------------------------------------------------
+
+func DoURL(ctx context.Context, urlStr string, ext string, fn DoFn) (*sio.Output, error) {
+	src := sio.NewURLReader(urlStr)
+	return sio.Process(ctx, src, ext, fn)
+}
+
+// -----------------------------------------------------------------------------
+// streaming helper
+// -----------------------------------------------------------------------------
+
+func StreamOutput(out *sio.Output, w io.Writer) (int64, error) {
+	sr := out.Reader()
+	rc, err := sr.Open()
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+	defer sr.Cleanup()
+
+	return io.Copy(w, rc)
+}
