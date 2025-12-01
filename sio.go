@@ -1120,3 +1120,15 @@ func ToOutput(ctx context.Context, src StreamReader, ext string) (*Output, error
 		return err
 	})
 }
+
+func CopyOutputTo(out *Output, w io.Writer) (int64, error) {
+	sr := out.Reader()
+	rc, err := sr.Open()
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+	defer sr.Cleanup()
+
+	return io.Copy(w, rc)
+}
