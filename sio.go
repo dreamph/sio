@@ -32,16 +32,21 @@ var (
 	ErrNoSession       = errors.New("sio: session is nil")
 )
 
-var httpClient = &http.Client{Timeout: 30 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{
-			//InsecureSkipVerify: true,
-		},
-	},
+const (
+	DefaultBaseTempDir = "./temp"
+)
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+type Config struct {
+	Client *http.Client
 }
 
-func SetHttpClient(c *http.Client) {
-	httpClient = c
+func Configure(config Config) error {
+	if config.Client != nil {
+		httpClient = config.Client
+	}
+	return nil
 }
 
 /* -------------------------------------------------------------------------- */
@@ -145,14 +150,59 @@ func (b *BytesReader) Cleanup() error {
 /*                                 URLReader                                   */
 /* -------------------------------------------------------------------------- */
 
+type URLReaderOptions struct {
+	Client      *http.Client
+	InsecureTLS bool
+	Timeout     time.Duration
+}
+
 // URLReader streams content directly from a URL.
 // Each Open() call creates a new HTTP request.
 // Cleanup() is a no-op since the response body is closed via the returned ReadCloser.
 type URLReader struct {
-	URL string
+	URL    string
+	client *http.Client
 }
 
-func NewURLReader(urlStr string) *URLReader { return &URLReader{URL: urlStr} }
+func NewURLReader(urlStr string, opts ...URLReaderOptions) *URLReader {
+	r := &URLReader{URL: urlStr}
+
+	baseTimeout := httpClient.Timeout
+	if baseTimeout == 0 {
+		baseTimeout = 30 * time.Second
+	}
+
+	if len(opts) == 0 {
+		r.client = httpClient
+		return r
+	}
+
+	opt := opts[0]
+
+	if opt.Client != nil {
+		r.client = opt.Client
+		return r
+	}
+
+	c := &http.Client{
+		Timeout: baseTimeout,
+	}
+
+	if opt.Timeout > 0 {
+		c.Timeout = opt.Timeout
+	}
+
+	if opt.InsecureTLS {
+		c.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec
+			},
+		}
+	}
+
+	r.client = c
+	return r
+}
 
 func (u *URLReader) Open() (io.ReadCloser, error) {
 	parsed, err := url.Parse(u.URL)
@@ -163,7 +213,7 @@ func (u *URLReader) Open() (io.ReadCloser, error) {
 		return nil, ErrInvalidURL
 	}
 
-	resp, err := httpClient.Get(u.URL)
+	resp, err := u.client.Get(u.URL)
 	if err != nil {
 		return nil, ErrDownloadFailed
 	}
@@ -615,17 +665,7 @@ func (o *Output) SaveAs(path string) error {
 	}
 	defer r.Close()
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = io.Copy(f, r)
+	_, err = copyToFile(r, path)
 	return err
 }
 
@@ -918,8 +958,44 @@ func Session(ctx context.Context) IoSession {
 	return ses
 }
 
+func readDirect(ctx context.Context, source StreamReader, fn ReadFunc) error {
+	if source == nil {
+		return ErrNilSource
+	}
+	if fn == nil {
+		return fmt.Errorf("sio: Read: fn is nil")
+	}
+
+	r, err := source.Open()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrOpenFailed, err)
+	}
+	defer r.Close()
+	defer source.Cleanup()
+
+	return fn(ctx, r)
+}
+
+func readListDirect(ctx context.Context, sources []StreamReader, fn ReadListFunc) error {
+	if len(sources) == 0 {
+		return ErrNilSource
+	}
+	if fn == nil {
+		return fmt.Errorf("sio: ReadList: fn is nil")
+	}
+
+	rl, err := OpenReaderList(sources)
+	if err != nil {
+		return err
+	}
+	defer rl.Close()
+
+	return fn(ctx, rl.Readers)
+}
+
 // Read is a convenience wrapper that gets IoSession from context
-// and calls ses.Read(...).
+// and calls ses.Read(...). If there is no session, it falls back
+// to direct streaming from the StreamReader.
 func Read(ctx context.Context, source StreamReader, fn ReadFunc) error {
 	if source == nil {
 		return ErrNilSource
@@ -929,14 +1005,16 @@ func Read(ctx context.Context, source StreamReader, fn ReadFunc) error {
 	}
 
 	ses := Session(ctx)
-	if ses == nil {
-		return ErrNoSession
+	if ses != nil {
+		return ses.Read(ctx, source, fn)
 	}
 
-	return ses.Read(ctx, source, fn)
+	// fallback: no session bound → read directly
+	return readDirect(ctx, source, fn)
 }
 
 // ReadList is a convenience wrapper for IoSession.ReadList.
+// If there is no session, it falls back to direct streaming.
 func ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) error {
 	if len(sources) == 0 {
 		return ErrNilSource
@@ -946,11 +1024,11 @@ func ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) erro
 	}
 
 	ses := Session(ctx)
-	if ses == nil {
-		return ErrNoSession
+	if ses != nil {
+		return ses.ReadList(ctx, sources, fn)
 	}
 
-	return ses.ReadList(ctx, sources, fn)
+	return readListDirect(ctx, sources, fn)
 }
 
 // Process is a convenience wrapper for IoSession.Process.
@@ -992,21 +1070,15 @@ func ReadResult[T any](ctx context.Context, source StreamReader, fn func(ctx con
 		return nil, ErrNilSource
 	}
 	if fn == nil {
-		return nil, fmt.Errorf("sio: ReadWithResult: fn is nil")
-	}
-
-	ses := Session(ctx)
-	if ses == nil {
-		return nil, ErrNoSession
+		return nil, fmt.Errorf("sio: ReadResult: fn is nil")
 	}
 
 	var result *T
-	err := ses.Read(ctx, source, func(ctx context.Context, r io.Reader) error {
+	err := Read(ctx, source, func(ctx context.Context, r io.Reader) error {
 		res, err := fn(ctx, r)
 		if err != nil {
 			return err
 		}
-
 		result = res
 		return nil
 	})
@@ -1017,10 +1089,7 @@ func ReadResult[T any](ctx context.Context, source StreamReader, fn func(ctx con
 	return result, nil
 }
 
-func ReadListResult[T any](
-	ctx context.Context,
-	sources []StreamReader,
-	fn func(ctx context.Context, readers []io.Reader) (*T, error),
+func ReadListResult[T any](ctx context.Context, sources []StreamReader, fn func(ctx context.Context, readers []io.Reader) (*T, error),
 ) (*T, error) {
 	if len(sources) == 0 {
 		return nil, fmt.Errorf("sio: ReadListResult: empty sources")
@@ -1029,13 +1098,8 @@ func ReadListResult[T any](
 		return nil, fmt.Errorf("sio: ReadListResult: fn is nil")
 	}
 
-	ses := Session(ctx)
-	if ses == nil {
-		return nil, ErrNoSession
-	}
-
 	var result *T
-	err := ses.ReadList(ctx, sources, func(ctx context.Context, readers []io.Reader) error {
+	err := ReadList(ctx, sources, func(ctx context.Context, readers []io.Reader) error {
 		res, err := fn(ctx, readers)
 		if err != nil {
 			return err
@@ -1046,15 +1110,11 @@ func ReadListResult[T any](
 	if err != nil {
 		return nil, err
 	}
+
 	return result, nil
 }
 
-func ProcessResult[T any](
-	ctx context.Context,
-	source StreamReader,
-	outExt string,
-	fn func(ctx context.Context, r io.Reader, w io.Writer) (*T, error),
-) (*Output, *T, error) {
+func ProcessResult[T any](ctx context.Context, source StreamReader, outExt string, fn func(ctx context.Context, r io.Reader, w io.Writer) (*T, error)) (*Output, *T, error) {
 	if source == nil {
 		return nil, nil, ErrNilSource
 	}
@@ -1082,11 +1142,7 @@ func ProcessResult[T any](
 	return out, result, nil
 }
 
-func ProcessListResult[T any](
-	ctx context.Context,
-	sources []StreamReader,
-	outExt string,
-	fn func(ctx context.Context, readers []io.Reader, w io.Writer) (*T, error),
+func ProcessListResult[T any](ctx context.Context, sources []StreamReader, outExt string, fn func(ctx context.Context, readers []io.Reader, w io.Writer) (*T, error),
 ) (*Output, *T, error) {
 	if len(sources) == 0 {
 		return nil, nil, fmt.Errorf("sio: ProcessListResult: empty sources")
@@ -1117,7 +1173,7 @@ func ProcessListResult[T any](
 
 func ToOutput(ctx context.Context, src StreamReader, ext string) (*Output, error) {
 	return Process(ctx, src, ext, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		_, err := io.Copy(w, r)
+		_, err := copyStream(w, r)
 		return err
 	})
 }
@@ -1131,7 +1187,29 @@ func CopyOutputTo(out *Output, w io.Writer) (int64, error) {
 	defer rc.Close()
 	defer sr.Cleanup()
 
-	return io.Copy(w, rc)
+	return copyStream(w, rc)
+}
+
+func WriteFile(r io.Reader, path string) (int64, error) {
+	if r == nil {
+		return 0, ErrNilSource
+	}
+	return copyToFile(r, path)
+}
+
+func WriteStreamToFile(src StreamReader, path string) (int64, error) {
+	if src == nil {
+		return 0, ErrNilSource
+	}
+
+	rc, err := src.Open()
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+	defer src.Cleanup()
+
+	return WriteFile(rc, path)
 }
 
 type LineFn func(line string) error
@@ -1164,3 +1242,85 @@ func ReadFileLines(ctx context.Context, path string, fn LineFn) error {
 	src := NewFileReader(path)
 	return ReadLines(ctx, src, fn)
 }
+
+func GetFileSize(ctx context.Context, source StreamReader) (int64, error) {
+	fileSize, err := ReadResult[int64](ctx, source, func(ctx context.Context, r io.Reader) (*int64, error) {
+		fileSize := GetFileSizeByReader(r)
+		return &fileSize, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return *fileSize, nil
+}
+
+func GetFileSizeByReader(r io.Reader) int64 {
+	switch v := r.(type) {
+	case *os.File:
+		if fi, err := v.Stat(); err == nil {
+			return fi.Size()
+		}
+	case interface{ Len() int }: // bytes.Reader, strings.Reader, bytes.Buffer
+		return int64(v.Len())
+	}
+	return -1
+}
+
+func GetFileSizeByPath(path string) (int64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+var copyBufPool = sync.Pool{
+	New: func() any {
+		// 1MB buffer – ปรับได้ตามใจ
+		return make([]byte, 1024*1024)
+	},
+}
+
+func Copy(dst io.Writer, src io.Reader) (int64, error) {
+	return copyStream(dst, src)
+}
+
+func copyStream(dst io.Writer, src io.Reader) (int64, error) {
+	// Fast-path: let types optimize themselves
+	if wt, ok := src.(io.WriterTo); ok {
+		return wt.WriteTo(dst)
+	}
+	if rf, ok := dst.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+
+	// Fallback: pooled buffer
+	buf := copyBufPool.Get().([]byte)
+	defer copyBufPool.Put(buf)
+	return io.CopyBuffer(dst, src, buf)
+}
+
+func copyToFile(src io.Reader, dstPath string) (int64, error) {
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return 0, err
+	}
+
+	f, err := os.Create(dstPath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	return copyStream(f, src)
+}
+
+const (
+	Pdf   = ".pdf"
+	Text  = ".txt"
+	Csv   = ".csv"
+	Jpg   = ".jpg"
+	Png   = ".png"
+	Excel = ".xlsx"
+	Docx  = ".docx"
+	Pptx  = ".pptx"
+)

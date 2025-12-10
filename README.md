@@ -1,7 +1,7 @@
 sio
 ===
 
-`sio` is a Go library for efficient, stream-based file processing with predictable memory usage. It provides disk-backed sessions, in-memory options, and a unified interface for files, bytes, URLs, multipart uploads, and generic io.Reader streams.
+`sio` is a Go library for efficient, stream-based file processing with predictable memory usage. It provides disk-backed sessions, in-memory options, and a unified interface for files, bytes, URLs, and multipart uploads.
 
 Contents
 --------
@@ -15,7 +15,7 @@ Contents
 
 Features
 --------
-- Unified `StreamReader` interface for files, bytes, URLs, multipart uploads, and generic `io.Reader`.
+- Unified `StreamReader` interface for files, bytes, URLs, and multipart uploads.
 - Disk-backed and in-memory session management for predictable resource usage.
 - Automatic cleanup of temporary files and session directories.
 - Simple helpers for copying, saving, and reading outputs.
@@ -39,38 +39,53 @@ import "github.com/dreamph/sio"
 Quick start
 -----------
 ```go
-ctx := context.Background()
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"path/filepath"
 
-ioManager, err := sio.NewIoManager("./temp") // or specify a base temp dir
-if err != nil {
-    log.Fatalf("manager: %v", err)
+	"github.com/dreamph/sio"
+)
+
+func main() {
+	ctx := context.Background()
+
+	ioManager, err := sio.NewIoManager(filepath.Join(sio.DefaultBaseTempDir, "app-temp1"))
+	if err != nil {
+		log.Fatalf("manager: %v", err)
+	}
+	defer ioManager.Cleanup()
+
+	ses, err := ioManager.NewSession()
+	if err != nil {
+		log.Fatalf("session: %v", err)
+	}
+	defer ses.Cleanup()
+
+	ctx = sio.WithSession(ctx, ses)
+
+	src := sio.NewBytesReader([]byte("hello world"))
+	output, err := sio.Process(ctx, src, sio.Text, func(ctx context.Context, r io.Reader, w io.Writer) error {
+		// example process file
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		log.Fatalf("process: %v", err)
+	}
+	defer output.Cleanup()
+
+	fmt.Printf("output file: %s\n", output.Path())
 }
-defer ioManager.Cleanup()
-
-ses, err := ioManager.NewSession()
-if err != nil {
-    log.Fatalf("session: %v", err)
-}
-defer ses.Cleanup()
-
-ctx := sio.WithSession(ctx, ses)
-in := sio.NewBytesReader([]byte("hello world"))
-output, err := sio.Process(ctx, in, ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
-    _, err := io.Copy(w, r)
-    return err
-})
-if err != nil {
-    log.Fatalf("process: %v", err)
-}
-
-fmt.Printf("output file: %s\n", output.Path())
 ```
 
 API Overview
 ------------
-- `IoManager`: Manages a root temp directory and creates isolated `IoSession`s.
-- `IoSession`: Processes streams, manages outputs, and cleans up temp files.
-- `StreamReader`: Interface for file, bytes, URL, multipart, and generic `io.Reader` sources.
+- `Manager`: Manages a root temp directory and creates isolated `Session`s.
+- `Session`: Processes streams, manages outputs, and cleans up temp files.
+- `StreamReader`: Interface for file, bytes, URL, and multipart sources.
 - `Output`: Represents a processed file, can be saved, read, or kept.
 
 Example: HTTP File Processing
@@ -79,33 +94,38 @@ See `example/main.go` for a full HTTP server. Here is a minimal handler:
 
 ```go
 app.Post("/process", func(c *fiber.Ctx) error {
-    fileHeader, err := c.FormFile("file")
-    if err != nil {
-        return fiber.NewError(fiber.StatusBadRequest, "missing file")
-    }
-	
-    in := sio.NewMultipartReader(fileHeader)
-    ses, _ := mgr.NewSession()
-    if err != nil {
-        return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-    }
-    defer ses.Cleanup()
+	ctx := c.Context()
 
-	ctx := sio.WithSession(c.UserContext(), ses)
-    output, err := sio.Process(ctx, in, ".pdf", func(ctx context.Context, r io.Reader, w io.Writer) error {
-        _, err := io.Copy(w, r)
-        return err
-    })
-    if err != nil {
-        return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-    }
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "missing file")
+	}
 
-    readerCloser, err := sio.NewDownloadReaderCloser(output.Reader())
-    if err != nil {
-    return err
-    }
-    
-    return c.SendStream(readerCloser)
+	// ioManager should be created at application startup
+	ses, err := ioManager.NewSession()
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	defer ses.Cleanup()
+
+	ctx = sio.WithSession(ctx, ses)
+
+	in := sio.NewMultipartReader(fileHeader)
+	output, err := sio.Process(ctx, in, sio.Pdf, func(ctx context.Context, r io.Reader, w io.Writer) error {
+		// example process file
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+
+	readerCloser, err := sio.NewDownloadReaderCloser(output.AsStreamReader())
+	if err != nil {
+		return err
+	}
+
+	return c.SendStream(readerCloser)
 })
 ```
 
