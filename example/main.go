@@ -28,10 +28,6 @@ func newServerApp(ioManager sio.IoManager) (*fiber.App, error) {
 		}
 
 		outputExt := filepath.Ext(fileHeader.Filename)
-		if outputExt == "" {
-			outputExt = ".bin"
-		}
-
 		ses, err := ioManager.NewSession()
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, err.Error())

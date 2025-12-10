@@ -75,7 +75,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("process: %v", err)
 	}
-	defer output.Cleanup()
 
 	fmt.Printf("output file: %s\n", output.Path())
 }
@@ -94,38 +93,38 @@ See `example/main.go` for a full HTTP server. Here is a minimal handler:
 
 ```go
 app.Post("/process", func(c *fiber.Ctx) error {
-	ctx := c.Context()
-
-	fileHeader, err := c.FormFile("file")
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "missing file")
-	}
-
-	// ioManager should be created at application startup
-	ses, err := ioManager.NewSession()
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-	defer ses.Cleanup()
-
-	ctx = sio.WithSession(ctx, ses)
-
-	in := sio.NewMultipartReader(fileHeader)
-	output, err := sio.Process(ctx, in, sio.Pdf, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		// example process file
-		_, err := io.Copy(w, r)
-		return err
-	})
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-	}
-
-	readerCloser, err := sio.NewDownloadReaderCloser(output.AsStreamReader())
-	if err != nil {
-		return err
-	}
-
-	return c.SendStream(readerCloser)
+    fileHeader, err := c.FormFile("file")
+    if err != nil {
+        return fiber.NewError(fiber.StatusBadRequest, "missing multipart form field : file")
+    }
+    
+    outputExt := filepath.Ext(fileHeader.Filename)
+    ses, err := ioManager.NewSession()
+    if err != nil {
+        return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+    }
+    defer ses.Cleanup()
+    
+    ctx := sio.WithSession(c.UserContext(), ses)
+    
+    in := sio.NewMultipartReader(fileHeader)
+    output, err := sio.Process(ctx, in, outputExt, func(ctx context.Context, r io.Reader, w io.Writer) error {
+        _, err := io.Copy(w, r)
+        return err
+    })
+    if err != nil {
+        return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("process failed: %v", err))
+    }
+    
+    c.Type("application/octet-stream")
+    c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", "processed"+outputExt))
+    
+    readerCloser, err := sio.NewDownloadReaderCloser(output.Reader())
+    if err != nil {
+        return err
+    }
+    
+    return c.SendStream(readerCloser)
 })
 ```
 
