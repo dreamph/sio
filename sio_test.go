@@ -1,364 +1,996 @@
 package sio
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestStorageFile(t *testing.T) {
-	// Create IoManager with StorageFile (default)
-	mgr, err := NewIoManager("./test-temp", StorageFile)
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
-	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-	defer ses.Cleanup()
-
-	// Test Process with file storage
-	ctx := context.Background()
-	input := NewBytesReader([]byte("Hello, File Storage!"))
-
-	out, err := ses.Process(ctx, input, Text, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		_, err := io.Copy(w, r)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("Process failed: %v", err)
+func TestStorageTypeString(t *testing.T) {
+	tests := []struct {
+		st   StorageType
+		want string
+	}{
+		{StorageFile, "file"},
+		{StorageBytes, "memory"},
+		{File, "file"},
+		{Mem, "memory"},
 	}
 
-	// Verify output
-	data, err := out.Bytes()
-	if err != nil {
-		t.Fatalf("Failed to read output: %v", err)
-	}
-
-	if string(data) != "Hello, File Storage!" {
-		t.Errorf("Expected 'Hello, File Storage!', got '%s'", string(data))
-	}
-
-	// Verify that file was created
-	if out.Path() == "" {
-		t.Error("Expected non-empty file path for StorageFile mode")
-	}
-}
-
-func TestStorageBytes(t *testing.T) {
-	// Create IoManager with StorageBytes
-	mgr, err := NewIoManager("", StorageBytes)
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
-	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-	defer ses.Cleanup()
-
-	// Test Process with memory storage
-	ctx := context.Background()
-	input := NewBytesReader([]byte("Hello, Memory Storage!"))
-
-	out, err := ses.Process(ctx, input, Text, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		_, err := io.Copy(w, r)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("Process failed: %v", err)
-	}
-
-	// Verify output
-	data, err := out.Bytes()
-	if err != nil {
-		t.Fatalf("Failed to read output: %v", err)
-	}
-
-	if string(data) != "Hello, Memory Storage!" {
-		t.Errorf("Expected 'Hello, Memory Storage!', got '%s'", string(data))
-	}
-
-	// Verify that no file path exists for memory storage
-	if out.Path() != "" {
-		t.Error("Expected empty file path for StorageBytes mode")
-	}
-}
-
-func TestStorageBytesMultipleOutputs(t *testing.T) {
-	// Create IoManager with StorageBytes
-	mgr, err := NewIoManager("", StorageBytes)
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
-	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-	defer ses.Cleanup()
-
-	ctx := context.Background()
-
-	// Create first output
-	out1, err := ses.Process(ctx, NewBytesReader([]byte("Output 1")), Text, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		_, err := io.Copy(w, r)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("Process 1 failed: %v", err)
-	}
-
-	// Create second output
-	out2, err := ses.Process(ctx, NewBytesReader([]byte("Output 2")), Text, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		_, err := io.Copy(w, r)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("Process 2 failed: %v", err)
-	}
-
-	// Verify both outputs
-	data1, err := out1.Bytes()
-	if err != nil {
-		t.Fatalf("Failed to read output 1: %v", err)
-	}
-	if string(data1) != "Output 1" {
-		t.Errorf("Expected 'Output 1', got '%s'", string(data1))
-	}
-
-	data2, err := out2.Bytes()
-	if err != nil {
-		t.Fatalf("Failed to read output 2: %v", err)
-	}
-	if string(data2) != "Output 2" {
-		t.Errorf("Expected 'Output 2', got '%s'", string(data2))
-	}
-}
-
-func TestStorageBytesRead(t *testing.T) {
-	// Create IoManager with StorageBytes
-	mgr, err := NewIoManager("", StorageBytes)
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
-	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-	defer ses.Cleanup()
-
-	ctx := context.Background()
-	input := NewBytesReader([]byte("Test Read"))
-
-	var result string
-	err = ses.Read(ctx, input, func(ctx context.Context, r io.Reader) error {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			return err
+	for _, tt := range tests {
+		if got := tt.st.String(); got != tt.want {
+			t.Errorf("StorageType(%d).String() = %q, want %q", tt.st, got, tt.want)
 		}
+	}
+}
+
+func TestStorageFunction(t *testing.T) {
+	tests := []struct {
+		input string
+		want  StorageType
+	}{
+		{"file", StorageFile},
+		{"FILE", StorageFile},
+		{"disk", StorageFile},
+		{"bytes", StorageBytes},
+		{"mem", StorageBytes},
+		{"memory", StorageBytes},
+		{"MEMORY", StorageBytes},
+		{"  memory  ", StorageBytes},
+		{"unknown", StorageFile}, // default
+		{"", StorageFile},        // default
+	}
+
+	for _, tt := range tests {
+		if got := Storage(tt.input); got != tt.want {
+			t.Errorf("Storage(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestOutOption(t *testing.T) {
+	t.Run("without storage type", func(t *testing.T) {
+		opt := Out(".pdf")
+		if opt.Ext != ".pdf" {
+			t.Errorf("Ext = %q, want %q", opt.Ext, ".pdf")
+		}
+		if opt.StorageType != nil {
+			t.Error("StorageType should be nil")
+		}
+		// Should use session default
+		if got := opt.getStorageType(StorageFile); got != StorageFile {
+			t.Errorf("getStorageType(File) = %v, want File", got)
+		}
+		if got := opt.getStorageType(StorageBytes); got != StorageBytes {
+			t.Errorf("getStorageType(Bytes) = %v, want Bytes", got)
+		}
+	})
+
+	t.Run("with memory storage", func(t *testing.T) {
+		opt := Out(".pdf", Mem)
+		if opt.Ext != ".pdf" {
+			t.Errorf("Ext = %q, want %q", opt.Ext, ".pdf")
+		}
+		if opt.StorageType == nil {
+			t.Fatal("StorageType should not be nil")
+		}
+		if *opt.StorageType != StorageBytes {
+			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType)
+		}
+		// Should override session default
+		if got := opt.getStorageType(StorageFile); got != StorageBytes {
+			t.Errorf("getStorageType should return Bytes, got %v", got)
+		}
+	})
+
+	t.Run("with file storage", func(t *testing.T) {
+		opt := Out(".txt", File)
+		if *opt.StorageType != StorageFile {
+			t.Errorf("StorageType = %v, want File", *opt.StorageType)
+		}
+	})
+
+	t.Run("with Storage() string conversion", func(t *testing.T) {
+		opt := Out(".pdf", Storage("memory"))
+		if *opt.StorageType != StorageBytes {
+			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType)
+		}
+	})
+}
+
+func TestManagerWithStorageFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mgr, err := NewIoManager(tmpDir, StorageFile)
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer mgr.Cleanup()
+
+	ses, err := mgr.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer ses.Cleanup()
+
+	ctx := WithSession(context.Background(), ses)
+
+	// Process with default (file) storage
+	src := NewBytesReader([]byte("hello world"))
+	out, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	if out.StorageType() != StorageFile {
+		t.Errorf("StorageType = %v, want File", out.StorageType())
+	}
+
+	if out.Path() == "" {
+		t.Error("Path should not be empty for file storage")
+	}
+
+	// Verify file exists
+	if _, err := os.Stat(out.Path()); err != nil {
+		t.Errorf("output file should exist: %v", err)
+	}
+
+	// Read back
+	data, err := out.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	if string(data) != "hello world" {
+		t.Errorf("got %q, want %q", string(data), "hello world")
+	}
+}
+
+func TestManagerWithStorageBytes(t *testing.T) {
+	mgr, err := NewIoManager("", StorageBytes)
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer mgr.Cleanup()
+
+	ses, err := mgr.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer ses.Cleanup()
+
+	ctx := WithSession(context.Background(), ses)
+
+	// Process with default (bytes) storage
+	src := NewBytesReader([]byte("hello memory"))
+	out, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	if out.StorageType() != StorageBytes {
+		t.Errorf("StorageType = %v, want Bytes", out.StorageType())
+	}
+
+	if out.Path() != "" {
+		t.Errorf("Path should be empty for bytes storage, got %q", out.Path())
+	}
+
+	// Use Data() for zero-copy access
+	data := out.Data()
+	if string(data) != "hello memory" {
+		t.Errorf("Data() = %q, want %q", string(data), "hello memory")
+	}
+
+	// Also test Bytes()
+	data2, err := out.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	if string(data2) != "hello memory" {
+		t.Errorf("Bytes() = %q, want %q", string(data2), "hello memory")
+	}
+}
+
+func TestMixedStorageInSession(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create manager with file storage (has directory)
+	mgr, err := NewIoManager(tmpDir, StorageFile)
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer mgr.Cleanup()
+
+	ses, err := mgr.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer ses.Cleanup()
+
+	ctx := WithSession(context.Background(), ses)
+
+	// First output: use memory
+	src1 := NewBytesReader([]byte("memory data"))
+	out1, err := Process(ctx, src1, Out(".txt", Mem), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process (mem): %v", err)
+	}
+	if out1.StorageType() != StorageBytes {
+		t.Errorf("out1 StorageType = %v, want Bytes", out1.StorageType())
+	}
+
+	// Second output: use file (explicit)
+	src2 := NewBytesReader([]byte("file data"))
+	out2, err := Process(ctx, src2, Out(".txt", File), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process (file): %v", err)
+	}
+	if out2.StorageType() != StorageFile {
+		t.Errorf("out2 StorageType = %v, want File", out2.StorageType())
+	}
+
+	// Third output: use session default (file)
+	src3 := NewBytesReader([]byte("default data"))
+	out3, err := Process(ctx, src3, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process (default): %v", err)
+	}
+	if out3.StorageType() != StorageFile {
+		t.Errorf("out3 StorageType = %v, want File", out3.StorageType())
+	}
+
+	// Verify all outputs
+	d1, _ := out1.Bytes()
+	d2, _ := out2.Bytes()
+	d3, _ := out3.Bytes()
+
+	if string(d1) != "memory data" {
+		t.Errorf("out1 = %q", string(d1))
+	}
+	if string(d2) != "file data" {
+		t.Errorf("out2 = %q", string(d2))
+	}
+	if string(d3) != "default data" {
+		t.Errorf("out3 = %q", string(d3))
+	}
+}
+
+func TestFileStorageUnavailableError(t *testing.T) {
+	// Create manager with bytes-only storage (no directory)
+	mgr, err := NewIoManager("", StorageBytes)
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer mgr.Cleanup()
+
+	ses, err := mgr.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer ses.Cleanup()
+
+	ctx := WithSession(context.Background(), ses)
+
+	// Try to force file storage - should fail
+	src := NewBytesReader([]byte("test"))
+	_, err = Process(ctx, src, Out(".txt", File), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+
+	if !errors.Is(err, ErrFileStorageUnavailable) {
+		t.Errorf("expected ErrFileStorageUnavailable, got %v", err)
+	}
+}
+
+func TestOutputReader(t *testing.T) {
+	t.Run("bytes storage returns BytesReader", func(t *testing.T) {
+		mgr, _ := NewIoManager("", StorageBytes)
+		defer mgr.Cleanup()
+		ses, _ := mgr.NewSession()
+		defer ses.Cleanup()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader([]byte("test"))
+		out, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+		if err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+
+		reader := out.Reader()
+		if _, ok := reader.(*BytesReader); !ok {
+			t.Errorf("Reader() returned %T, want *BytesReader", reader)
+		}
+	})
+
+	t.Run("file storage returns FileReader", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		mgr, _ := NewIoManager(tmpDir, StorageFile)
+		defer mgr.Cleanup()
+		ses, _ := mgr.NewSession()
+		defer ses.Cleanup()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader([]byte("test"))
+		out, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+		if err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+
+		reader := out.Reader()
+		if _, ok := reader.(*FileReader); !ok {
+			t.Errorf("Reader() returned %T, want *FileReader", reader)
+		}
+	})
+}
+
+func TestChainedProcessing(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	// First process: write "hello"
+	src := NewBytesReader([]byte("hello"))
+	out1, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process 1: %v", err)
+	}
+
+	// Chain: transform to uppercase
+	out2, err := Process(ctx, out1.Reader(), Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		data, _ := io.ReadAll(r)
+		_, err := w.Write([]byte(strings.ToUpper(string(data))))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process 2: %v", err)
+	}
+
+	data, _ := out2.Bytes()
+	if string(data) != "HELLO" {
+		t.Errorf("got %q, want %q", string(data), "HELLO")
+	}
+}
+
+func TestKeepFlag(t *testing.T) {
+	t.Run("bytes storage respects keep", func(t *testing.T) {
+		mgr, _ := NewIoManager("", StorageBytes)
+		defer mgr.Cleanup()
+		ses, _ := mgr.NewSession()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader([]byte("keep me"))
+		out, _ := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+
+		out.Keep()
+		ses.Cleanup()
+
+		// Data should still be accessible
+		data := out.Data()
+		if string(data) != "keep me" {
+			t.Errorf("Data after cleanup = %q, want %q", string(data), "keep me")
+		}
+	})
+
+	t.Run("file storage respects keep", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		mgr, _ := NewIoManager(tmpDir, StorageFile)
+		defer mgr.Cleanup()
+		ses, _ := mgr.NewSession()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader([]byte("keep me"))
+		out, _ := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+
+		path := out.Path()
+		out.Keep()
+		ses.Cleanup()
+
+		// File should still exist
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("kept file should exist: %v", err)
+		}
+	})
+}
+
+func TestSaveAs(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	src := NewBytesReader([]byte("save me"))
+	out, _ := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+
+	savePath := filepath.Join(t.TempDir(), "saved.txt")
+	if err := out.SaveAs(savePath); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+
+	data, err := os.ReadFile(savePath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "save me" {
+		t.Errorf("saved data = %q, want %q", string(data), "save me")
+	}
+}
+
+func TestReadAndReadList(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	t.Run("Read", func(t *testing.T) {
+		src := NewBytesReader([]byte("read test"))
+		var result string
+		err := Read(ctx, src, func(ctx context.Context, r io.Reader) error {
+			data, _ := io.ReadAll(r)
+			result = string(data)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if result != "read test" {
+			t.Errorf("result = %q, want %q", result, "read test")
+		}
+	})
+
+	t.Run("ReadList", func(t *testing.T) {
+		sources := []StreamReader{
+			NewBytesReader([]byte("one")),
+			NewBytesReader([]byte("two")),
+			NewBytesReader([]byte("three")),
+		}
+		var results []string
+		err := ReadList(ctx, sources, func(ctx context.Context, readers []io.Reader) error {
+			for _, r := range readers {
+				data, _ := io.ReadAll(r)
+				results = append(results, string(data))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("ReadList: %v", err)
+		}
+		if len(results) != 3 {
+			t.Errorf("got %d results, want 3", len(results))
+		}
+	})
+}
+
+func TestProcessList(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	sources := []StreamReader{
+		NewBytesReader([]byte("hello ")),
+		NewBytesReader([]byte("world")),
+	}
+
+	out, err := ProcessList(ctx, sources, Out(".txt", Mem), func(ctx context.Context, readers []io.Reader, w io.Writer) error {
+		for _, r := range readers {
+			if _, err := io.Copy(w, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ProcessList: %v", err)
+	}
+
+	data, _ := out.Bytes()
+	if string(data) != "hello world" {
+		t.Errorf("got %q, want %q", string(data), "hello world")
+	}
+}
+
+func TestNoSessionError(t *testing.T) {
+	ctx := context.Background() // no session
+
+	src := NewBytesReader([]byte("test"))
+	_, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		return nil
+	})
+
+	if !errors.Is(err, ErrNoSession) {
+		t.Errorf("expected ErrNoSession, got %v", err)
+	}
+}
+
+func TestNilSourceError(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	_, err := Process(ctx, nil, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		return nil
+	})
+
+	if !errors.Is(err, ErrNilSource) {
+		t.Errorf("expected ErrNilSource, got %v", err)
+	}
+}
+
+func TestReadWithoutSession(t *testing.T) {
+	// Read should work without session (falls back to direct streaming)
+	ctx := context.Background()
+
+	src := NewBytesReader([]byte("direct read"))
+	var result string
+	err := Read(ctx, src, func(ctx context.Context, r io.Reader) error {
+		data, _ := io.ReadAll(r)
 		result = string(data)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("Read failed: %v", err)
+		t.Fatalf("Read: %v", err)
 	}
-
-	if result != "Test Read" {
-		t.Errorf("Expected 'Test Read', got '%s'", result)
-	}
-}
-
-func TestStorageBytesReadList(t *testing.T) {
-	// Create IoManager with StorageBytes
-	mgr, err := NewIoManager("", StorageBytes)
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
-	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-	defer ses.Cleanup()
-
-	ctx := context.Background()
-	sources := []StreamReader{
-		NewBytesReader([]byte("Part 1")),
-		NewBytesReader([]byte("Part 2")),
-		NewBytesReader([]byte("Part 3")),
-	}
-
-	var results []string
-	err = ses.ReadList(ctx, sources, func(ctx context.Context, readers []io.Reader) error {
-		for _, r := range readers {
-			data, err := io.ReadAll(r)
-			if err != nil {
-				return err
-			}
-			results = append(results, string(data))
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("ReadList failed: %v", err)
-	}
-
-	expected := []string{"Part 1", "Part 2", "Part 3"}
-	if len(results) != len(expected) {
-		t.Errorf("Expected %d results, got %d", len(expected), len(results))
-	}
-
-	for i, exp := range expected {
-		if results[i] != exp {
-			t.Errorf("Expected '%s' at index %d, got '%s'", exp, i, results[i])
-		}
+	if result != "direct read" {
+		t.Errorf("result = %q, want %q", result, "direct read")
 	}
 }
 
-func TestStorageBytesProcessList(t *testing.T) {
-	// Create IoManager with StorageBytes
-	mgr, err := NewIoManager("", StorageBytes)
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
+func TestMultipleOutputs(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
 	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
+	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
 
-	ctx := context.Background()
-	sources := []StreamReader{
-		NewBytesReader([]byte("Part 1 ")),
-		NewBytesReader([]byte("Part 2 ")),
-		NewBytesReader([]byte("Part 3")),
-	}
-
-	out, err := ses.ProcessList(ctx, sources, Text, func(ctx context.Context, readers []io.Reader, w io.Writer) error {
-		for _, r := range readers {
+	var outputs []*Output
+	for i := 0; i < 5; i++ {
+		src := NewBytesReader([]byte("output"))
+		out, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
 			_, err := io.Copy(w, r)
-			if err != nil {
-				return err
-			}
+			return err
+		})
+		if err != nil {
+			t.Fatalf("Process %d: %v", i, err)
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("ProcessList failed: %v", err)
+		outputs = append(outputs, out)
 	}
 
-	// Verify output
-	data, err := out.Bytes()
-	if err != nil {
-		t.Fatalf("Failed to read output: %v", err)
-	}
-
-	expected := "Part 1 Part 2 Part 3"
-	if string(data) != expected {
-		t.Errorf("Expected '%s', got '%s'", expected, string(data))
+	// Verify all outputs
+	for i, out := range outputs {
+		data, _ := out.Bytes()
+		if string(data) != "output" {
+			t.Errorf("output %d = %q, want %q", i, string(data), "output")
+		}
 	}
 }
 
-func TestDefaultStorageType(t *testing.T) {
-	// Create IoManager without specifying storage type (should default to StorageFile)
-	mgr, err := NewIoManager("./test-temp-default")
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
+func TestLargeData(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
 	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
+	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
 
-	ctx := context.Background()
-	input := NewBytesReader([]byte("Default storage test"))
+	// 1MB of data
+	largeData := bytes.Repeat([]byte("x"), 1024*1024)
+	src := NewBytesReader(largeData)
 
-	out, err := ses.Process(ctx, input, Text, func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err := Process(ctx, src, Out(".bin"), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
 	if err != nil {
-		t.Fatalf("Process failed: %v", err)
+		t.Fatalf("Process: %v", err)
 	}
 
-	// Should have a file path (StorageFile mode)
-	if out.Path() == "" {
-		t.Error("Expected non-empty file path for default StorageFile mode")
-	}
-
-	// Verify content
-	data, err := out.Bytes()
-	if err != nil {
-		t.Fatalf("Failed to read output: %v", err)
-	}
-
-	if string(data) != "Default storage test" {
-		t.Errorf("Expected 'Default storage test', got '%s'", string(data))
+	data, _ := out.Bytes()
+	if len(data) != len(largeData) {
+		t.Errorf("len = %d, want %d", len(data), len(largeData))
 	}
 }
 
-func TestStorageBytesTransformation(t *testing.T) {
-	// Create IoManager with StorageBytes
-	mgr, err := NewIoManager("", StorageBytes)
-	if err != nil {
-		t.Fatalf("Failed to create IoManager: %v", err)
-	}
-	defer mgr.Cleanup()
-
-	// Create session
-	ses, err := mgr.NewSession()
-	if err != nil {
-		t.Fatalf("Failed to create session: %v", err)
-	}
-	defer ses.Cleanup()
-
+func TestReadResult(t *testing.T) {
 	ctx := context.Background()
-	input := NewBytesReader([]byte("hello world"))
 
-	// Transform to uppercase
-	out, err := ses.Process(ctx, input, Text, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			return err
+	src := NewBytesReader([]byte("42"))
+	result, err := ReadResult[int](ctx, src, func(ctx context.Context, r io.Reader) (*int, error) {
+		data, _ := io.ReadAll(r)
+		var n int
+		_, err := io.ReadFull(bytes.NewReader(data), []byte{})
+		if err != nil && err != io.EOF {
+			return nil, err
 		}
-		_, err = w.Write([]byte(strings.ToUpper(string(data))))
-		return err
+		n = 42 // simplified
+		return &n, nil
 	})
 	if err != nil {
-		t.Fatalf("Process failed: %v", err)
+		t.Fatalf("ReadResult: %v", err)
 	}
+	if *result != 42 {
+		t.Errorf("result = %d, want 42", *result)
+	}
+}
 
-	// Verify output
-	data, err := out.Bytes()
+func TestProcessResult(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	src := NewBytesReader([]byte("test data"))
+	out, result, err := ProcessResult[int](ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) (*int, error) {
+		data, _ := io.ReadAll(r)
+		w.Write(data)
+		n := len(data)
+		return &n, nil
+	})
 	if err != nil {
-		t.Fatalf("Failed to read output: %v", err)
+		t.Fatalf("ProcessResult: %v", err)
+	}
+	if *result != 9 {
+		t.Errorf("result = %d, want 9", *result)
 	}
 
-	expected := "HELLO WORLD"
-	if string(data) != expected {
-		t.Errorf("Expected '%s', got '%s'", expected, string(data))
+	outData, _ := out.Bytes()
+	if string(outData) != "test data" {
+		t.Errorf("output = %q, want %q", string(outData), "test data")
+	}
+}
+
+func TestToOutput(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	src := NewBytesReader([]byte("copy me"))
+	out, err := ToOutput(ctx, src, Out(".txt"))
+	if err != nil {
+		t.Fatalf("ToOutput: %v", err)
+	}
+
+	data, _ := out.Bytes()
+	if string(data) != "copy me" {
+		t.Errorf("got %q, want %q", string(data), "copy me")
+	}
+}
+
+func TestCopyOutputTo(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	src := NewBytesReader([]byte("copy to writer"))
+	out, _ := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+
+	var buf bytes.Buffer
+	n, err := CopyOutputTo(out, &buf)
+	if err != nil {
+		t.Fatalf("CopyOutputTo: %v", err)
+	}
+	if n != 14 {
+		t.Errorf("n = %d, want 14", n)
+	}
+	if buf.String() != "copy to writer" {
+		t.Errorf("got %q, want %q", buf.String(), "copy to writer")
+	}
+}
+
+func TestWriteFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.txt")
+
+	r := strings.NewReader("write to file")
+	n, err := WriteFile(r, path)
+	if err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if n != 13 {
+		t.Errorf("n = %d, want 13", n)
+	}
+
+	data, _ := os.ReadFile(path)
+	if string(data) != "write to file" {
+		t.Errorf("got %q, want %q", string(data), "write to file")
+	}
+}
+
+func TestWriteStreamToFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stream.txt")
+
+	src := NewBytesReader([]byte("stream to file"))
+	n, err := WriteStreamToFile(src, path)
+	if err != nil {
+		t.Fatalf("WriteStreamToFile: %v", err)
+	}
+	if n != 14 {
+		t.Errorf("n = %d, want 14", n)
+	}
+
+	data, _ := os.ReadFile(path)
+	if string(data) != "stream to file" {
+		t.Errorf("got %q, want %q", string(data), "stream to file")
+	}
+}
+
+func TestReadLines(t *testing.T) {
+	ctx := context.Background()
+
+	content := "line1\nline2\nline3"
+	src := NewBytesReader([]byte(content))
+
+	var lines []string
+	err := ReadLines(ctx, src, func(line string) error {
+		lines = append(lines, line)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadLines: %v", err)
+	}
+
+	if len(lines) != 3 {
+		t.Errorf("got %d lines, want 3", len(lines))
+	}
+	if lines[0] != "line1" || lines[1] != "line2" || lines[2] != "line3" {
+		t.Errorf("lines = %v", lines)
+	}
+}
+
+func TestSessionCleanup(t *testing.T) {
+	t.Run("cleans up bytes storage", func(t *testing.T) {
+		mgr, _ := NewIoManager("", StorageBytes)
+		defer mgr.Cleanup()
+		ses, _ := mgr.NewSession()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader([]byte("cleanup test"))
+		out, _ := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+
+		// Cleanup
+		ses.Cleanup()
+
+		// Data should be nil after cleanup
+		if out.Data() != nil {
+			t.Error("data should be nil after cleanup")
+		}
+	})
+
+	t.Run("cleans up file storage", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		mgr, _ := NewIoManager(tmpDir, StorageFile)
+		defer mgr.Cleanup()
+		ses, _ := mgr.NewSession()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader([]byte("cleanup test"))
+		out, _ := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+
+		path := out.Path()
+
+		// Cleanup
+		ses.Cleanup()
+
+		// File should not exist after cleanup
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Error("file should not exist after cleanup")
+		}
+	})
+}
+
+func TestFileReaderCleanup(t *testing.T) {
+	// Create a temp file
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	os.WriteFile(tmpFile, []byte("test"), 0644)
+
+	fr := NewFileReader(tmpFile)
+
+	// FileReader.Cleanup does NOT delete the file
+	fr.Cleanup()
+
+	if _, err := os.Stat(tmpFile); err != nil {
+		t.Error("FileReader.Cleanup should not delete the file")
+	}
+}
+
+func TestBytesReaderCleanup(t *testing.T) {
+	data := []byte("test data")
+	br := NewBytesReader(data)
+
+	br.Cleanup()
+
+	if br.Data != nil {
+		t.Error("BytesReader.Cleanup should set Data to nil")
+	}
+}
+
+func TestIOReader(t *testing.T) {
+	t.Run("wraps io.Reader", func(t *testing.T) {
+		r := strings.NewReader("io reader test")
+		ior := NewIOReader(r)
+
+		rc, err := ior.Open()
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer rc.Close()
+
+		data, _ := io.ReadAll(rc)
+		if string(data) != "io reader test" {
+			t.Errorf("got %q, want %q", string(data), "io reader test")
+		}
+	})
+
+	t.Run("wraps io.ReadCloser", func(t *testing.T) {
+		rc := io.NopCloser(strings.NewReader("read closer test"))
+		ior := NewIOReader(rc)
+
+		rc2, err := ior.Open()
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer rc2.Close()
+
+		data, _ := io.ReadAll(rc2)
+		if string(data) != "read closer test" {
+			t.Errorf("got %q, want %q", string(data), "read closer test")
+		}
+	})
+
+	t.Run("nil reader error", func(t *testing.T) {
+		ior := NewIOReader(nil)
+		_, err := ior.Open()
+		if err == nil {
+			t.Error("expected error for nil reader")
+		}
+	})
+}
+
+func TestManagerClosed(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	mgr.Cleanup()
+
+	_, err := mgr.NewSession()
+	if !errors.Is(err, ErrIoManagerClosed) {
+		t.Errorf("expected ErrIoManagerClosed, got %v", err)
+	}
+}
+
+func TestSessionClosed(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	ses.Cleanup()
+
+	ctx := WithSession(context.Background(), ses)
+	src := NewBytesReader([]byte("test"))
+
+	_, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		return nil
+	})
+	if !errors.Is(err, ErrIoSessionClosed) {
+		t.Errorf("expected ErrIoSessionClosed, got %v", err)
+	}
+}
+
+func TestGetFileSizeByReader(t *testing.T) {
+	t.Run("bytes reader with Len()", func(t *testing.T) {
+		data := []byte("hello")
+		r := bytes.NewReader(data)
+		size := GetFileSizeByReader(r)
+		if size != 5 {
+			t.Errorf("size = %d, want 5", size)
+		}
+	})
+
+	t.Run("unknown reader", func(t *testing.T) {
+		// io.NopCloser wraps a reader without Len()
+		r := io.NopCloser(strings.NewReader("test"))
+		size := GetFileSizeByReader(r)
+		if size != -1 {
+			t.Errorf("size = %d, want -1", size)
+		}
+	})
+}
+
+func BenchmarkStorageBytesProcess(b *testing.B) {
+	mgr, _ := NewIoManager("", StorageBytes)
+	defer mgr.Cleanup()
+
+	data := bytes.Repeat([]byte("x"), 1024) // 1KB
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ses, _ := mgr.NewSession()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader(data)
+		out, _ := Process(ctx, src, Out(".bin"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+		_ = out.Data()
+
+		ses.Cleanup()
+	}
+}
+
+func BenchmarkStorageFileProcess(b *testing.B) {
+	tmpDir := b.TempDir()
+	mgr, _ := NewIoManager(tmpDir, StorageFile)
+	defer mgr.Cleanup()
+
+	data := bytes.Repeat([]byte("x"), 1024) // 1KB
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ses, _ := mgr.NewSession()
+		ctx := WithSession(context.Background(), ses)
+
+		src := NewBytesReader(data)
+		out, _ := Process(ctx, src, Out(".bin"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+			_, err := io.Copy(w, r)
+			return err
+		})
+		_, _ = out.Bytes()
+
+		ses.Cleanup()
 	}
 }

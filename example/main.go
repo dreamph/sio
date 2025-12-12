@@ -37,7 +37,7 @@ func newServerApp(ioManager sio.IoManager) (*fiber.App, error) {
 		ctx := sio.WithSession(c.UserContext(), ses)
 
 		in := sio.NewMultipartReader(fileHeader)
-		output, err := sio.Process(ctx, in, outputExt, func(ctx context.Context, r io.Reader, w io.Writer) error {
+		output, err := sio.Process(ctx, in, sio.Out(outputExt), func(ctx context.Context, r io.Reader, w io.Writer) error {
 			_, err := io.Copy(w, r)
 			return err
 		})
