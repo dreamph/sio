@@ -36,6 +36,18 @@ const (
 	DefaultBaseTempDir = "./temp"
 )
 
+/* ---------- Storage Types ---------- */
+
+// StorageType defines how the IoManager stores data
+type StorageType int
+
+const (
+	// StorageFile stores data as temporary files on disk (default)
+	StorageFile StorageType = iota
+	// StorageBytes stores data in memory as byte slices
+	StorageBytes
+)
+
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 type Config struct {
@@ -240,21 +252,40 @@ type IoManager interface {
 // IoManager manages a root directory under which multiple IoSessions
 // create their own isolated working directories.
 type manager struct {
-	mu      sync.Mutex
-	baseDir string
-	closed  bool
+	mu          sync.Mutex
+	baseDir     string
+	closed      bool
+	storageType StorageType
 }
 
 // NewIoManager :
 //   - baseDir == "" → create a temp folder using os.MkdirTemp("", "sio-")
 //   - baseDir != "" → create/use the provided directory
-func NewIoManager(baseDir string) (IoManager, error) {
+//   - storageType: optional parameter to specify storage strategy (default: StorageFile)
+func NewIoManager(baseDir string, storageType ...StorageType) (IoManager, error) {
+	st := StorageFile // default
+	if len(storageType) > 0 {
+		st = storageType[0]
+	}
+
+	// For StorageBytes, we don't need a directory
+	if st == StorageBytes {
+		return &manager{
+			baseDir:     "",
+			storageType: st,
+		}, nil
+	}
+
+	// For StorageFile, create/use the directory
 	if strings.TrimSpace(baseDir) == "" {
 		dir, err := os.MkdirTemp("", "sio-")
 		if err != nil {
 			return nil, err
 		}
-		return &manager{baseDir: dir}, nil
+		return &manager{
+			baseDir:     dir,
+			storageType: st,
+		}, nil
 	}
 
 	baseDir = filepath.Clean(baseDir)
@@ -262,7 +293,10 @@ func NewIoManager(baseDir string) (IoManager, error) {
 		return nil, err
 	}
 
-	return &manager{baseDir: baseDir}, nil
+	return &manager{
+		baseDir:     baseDir,
+		storageType: st,
+	}, nil
 }
 
 // BaseDir returns the underlying root directory managed by this IoManager.
@@ -281,13 +315,27 @@ func (m *manager) NewSession() (IoSession, error) {
 		return nil, ErrIoManagerClosed
 	}
 
+	// For StorageBytes mode, no directory is needed
+	if m.storageType == StorageBytes {
+		return &ioSession{
+			manager:     m,
+			dir:         "",
+			storageType: m.storageType,
+		}, nil
+	}
+
+	// For StorageFile mode, create session directory
 	id := uuid.New().String()
 	dir := filepath.Join(m.baseDir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
-	return &ioSession{manager: m, dir: dir}, nil
+	return &ioSession{
+		manager:     m,
+		dir:         dir,
+		storageType: m.storageType,
+	}, nil
 }
 
 // Cleanup removes the entire baseDir. Use only during app shutdown.
@@ -329,11 +377,12 @@ type IoSession interface {
 // session represents an isolated working directory where all temporary files
 // and transformation outputs are stored during a single job or request.
 type ioSession struct {
-	mu      sync.Mutex
-	manager IoManager
-	dir     string
-	closed  bool
-	outputs []*Output // tracked outputs inside this session
+	mu          sync.Mutex
+	manager     IoManager
+	dir         string
+	closed      bool
+	outputs     []*Output // tracked outputs inside this session
+	storageType StorageType
 }
 
 // Dir returns the directory assigned to this IoIoSession.
@@ -361,6 +410,19 @@ func (s *ioSession) newOutput(ext string) (*Output, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// For StorageBytes mode, create an in-memory output
+	if s.storageType == StorageBytes {
+		out := &Output{
+			path:        "",
+			ses:         s,
+			data:        nil,
+			storageType: StorageBytes,
+		}
+		s.outputs = append(s.outputs, out)
+		return out, nil
+	}
+
+	// For StorageFile mode, create a temporary file
 	pattern := "*"
 	if ext != "" {
 		pattern += ext
@@ -372,7 +434,11 @@ func (s *ioSession) newOutput(ext string) (*Output, error) {
 	}
 	f.Close()
 
-	out := &Output{path: f.Name(), ses: s}
+	out := &Output{
+		path:        f.Name(),
+		ses:         s,
+		storageType: StorageFile,
+	}
 	s.outputs = append(s.outputs, out)
 	return out, nil
 }
@@ -512,6 +578,10 @@ func (s *ioSession) ReadList(
 		return fmt.Errorf("sio: ReadList: fn is nil")
 	}
 
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
+
 	rl, err := OpenReaderList(sources)
 	if err != nil {
 		return err
@@ -548,6 +618,24 @@ func (s *ioSession) Cleanup() error {
 	}
 	s.closed = true
 
+	// For StorageBytes mode, just clean up in-memory outputs
+	if s.storageType == StorageBytes {
+		var firstErr error
+		for _, out := range s.outputs {
+			out.mu.Lock()
+			shouldSkip := out.keep && !out.closed
+			out.mu.Unlock()
+			if shouldSkip {
+				continue
+			}
+			if err := out.cleanup(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+
+	// For StorageFile mode, clean up files
 	entries, err := os.ReadDir(s.dir)
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -572,6 +660,43 @@ func (s *ioSession) Cleanup() error {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                           Storage Helper Types                              */
+/* -------------------------------------------------------------------------- */
+
+const defaultBufSize = 64 * 1024 // 64KB
+
+var bytesBufferPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, defaultBufSize))
+	},
+}
+
+// bytesWriteCloser wraps a bytes.Buffer to implement io.WriteCloser
+type bytesWriteCloser struct {
+	buf    *bytes.Buffer
+	output *Output
+}
+
+func (b *bytesWriteCloser) Write(p []byte) (int, error) {
+	return b.buf.Write(p)
+}
+
+func (b *bytesWriteCloser) Close() error {
+	if b.output != nil {
+		b.output.mu.Lock()
+		// Take ownership - zero copy
+		b.output.data = b.buf.Bytes()
+		b.output.mu.Unlock()
+		// Don't return to pool - output now owns the backing array
+		return nil
+	}
+	// Only return to pool if no output (error case)
+	b.buf.Reset()
+	bytesBufferPool.Put(b.buf)
+	return nil
+}
+
+/* -------------------------------------------------------------------------- */
 /*                                  Output                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -584,6 +709,10 @@ type Output struct {
 	closed       bool
 	keep         bool
 	detachedPath string // file copied outside the session dir (for detached use)
+
+	// For StorageBytes mode
+	data        []byte
+	storageType StorageType
 }
 
 func (o *Output) Path() string {
@@ -599,6 +728,16 @@ func (o *Output) OpenReader() (io.ReadCloser, error) {
 	if o.closed {
 		return nil, fmt.Errorf("sio: output is cleaned up")
 	}
+
+	// For StorageBytes mode, return reader from memory
+	if o.storageType == StorageBytes {
+		if o.data == nil {
+			return io.NopCloser(bytes.NewReader([]byte{})), nil
+		}
+		return io.NopCloser(bytes.NewReader(o.data)), nil
+	}
+
+	// For StorageFile mode, return file reader
 	return os.Open(o.path)
 }
 
@@ -609,11 +748,32 @@ func (o *Output) OpenWriter() (io.WriteCloser, error) {
 	if o.closed {
 		return nil, fmt.Errorf("sio: output is cleaned up")
 	}
+
+	// For StorageBytes mode, return pooled buffer writer
+	if o.storageType == StorageBytes {
+		buf := bytesBufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		return &bytesWriteCloser{
+			buf:    buf,
+			output: o,
+		}, nil
+	}
+
+	// For StorageFile mode, return file writer
 	return os.Create(o.path)
 }
 
 func (o *Output) Reader(opts ...InOption) StreamReader {
-	sr := NewFileReader(o.Path())
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	var sr StreamReader
+	if o.storageType == StorageBytes {
+		sr = NewBytesReader(o.data)
+	} else {
+		sr = NewFileReader(o.path)
+	}
+
 	if len(opts) > 0 {
 		return In(sr, opts...)
 	}
@@ -632,6 +792,13 @@ func (o *Output) cleanup() error {
 
 	var errs error
 
+	// For StorageBytes mode, just clear the data
+	if o.storageType == StorageBytes {
+		o.data = nil
+		return nil
+	}
+
+	// For StorageFile mode, remove the files
 	// Remove the file inside the session.
 	if err := os.Remove(o.path); err != nil && !os.IsNotExist(err) {
 		errs = errors.Join(errs, err)
@@ -816,34 +983,23 @@ func (d *downloadReaderCloser) Read(p []byte) (int, error) {
 func (d *downloadReaderCloser) Close() error {
 	var errs error
 
-	// 1) Close the underlying reader
 	if d.reader != nil {
-		readerCloseErr := d.reader.Close()
-		if readerCloseErr != nil {
-			errs = errors.Join(errs, readerCloseErr)
+		if err := d.reader.Close(); err != nil {
+			errs = errors.Join(errs, err)
 		}
 		d.reader = nil
 	}
 
-	// 2) Cleanup the StreamReader (e.g., remove temp files)
 	if d.streamReader != nil {
-		streamReaderCleanupErr := d.streamReader.Cleanup()
-		if streamReaderCleanupErr != nil {
-			errs = errors.Join(errs, streamReaderCleanupErr)
+		if err := d.streamReader.Cleanup(); err != nil {
+			errs = errors.Join(errs, err)
 		}
 		d.streamReader = nil
 	}
 
-	// 3) Run the optional extra cleanup callback
 	if d.Cleanup != nil {
 		d.Cleanup()
 		d.Cleanup = nil
-	}
-
-	if errs != nil {
-		fmt.Println("downloadReaderCloser.Close, Err:", errs)
-	} else {
-		fmt.Println("downloadReaderCloser.Close")
 	}
 
 	return errs
