@@ -28,7 +28,7 @@ var (
 	ErrInvalidURL             = errors.New("sio: invalid URL")
 	ErrDownloadFailed         = errors.New("sio: download failed")
 	ErrNoSession              = errors.New("sio: session is nil")
-	ErrFileStorageUnavailable = errors.New("sio: file storage requires directory (manager created with StorageBytes only)")
+	ErrFileStorageUnavailable = errors.New("sio: file storage requires directory (manager created with StorageMemory only)")
 	ErrInvalidSessionType     = errors.New("sio: invalid session type")
 )
 
@@ -46,23 +46,23 @@ type StorageType int
 const (
 	// StorageFile stores data as temporary files on disk (default)
 	StorageFile StorageType = iota
-	// StorageBytes stores data in memory as byte slices
-	StorageBytes
+	// StorageMemory stores data in memory as byte slices
+	StorageMemory
 )
 
 // Shorthand aliases
 const (
-	Mem  = StorageBytes
-	File = StorageFile
+	Memory = StorageMemory
+	File   = StorageFile
 )
 
 // Storage converts string to StorageType.
-// Supports: "file", "disk", "bytes", "mem", "memory"
+// Supports: "file", "memory"
 func Storage(s string) StorageType {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "bytes", "mem", "memory":
-		return StorageBytes
-	default: // "file", "disk", or unknown
+	case "memory":
+		return StorageMemory
+	default: // "file" or unknown
 		return StorageFile
 	}
 }
@@ -70,7 +70,7 @@ func Storage(s string) StorageType {
 // String returns string representation of StorageType
 func (s StorageType) String() string {
 	switch s {
-	case StorageBytes:
+	case StorageMemory:
 		return "memory"
 	case StorageFile:
 		return "file"
@@ -83,8 +83,8 @@ func (s StorageType) String() string {
 /*                             Output Options                                  */
 /* -------------------------------------------------------------------------- */
 
-// OutOption configures output behavior
-type OutOption struct {
+// OutConfig configures output behavior
+type OutConfig struct {
 	Ext         string
 	StorageType *StorageType // nil = use session default
 }
@@ -94,11 +94,11 @@ type OutOption struct {
 // Usage:
 //
 //	sio.Out(".pdf")                        // use session default
-//	sio.Out(".pdf", sio.Mem)               // force memory storage
+//	sio.Out(".pdf", sio.Memory)            // force memory storage
 //	sio.Out(".pdf", sio.File)              // force file storage
 //	sio.Out(".pdf", sio.Storage("memory")) // from string config
-func Out(ext string, opts ...StorageType) OutOption {
-	o := OutOption{Ext: ext}
+func Out(ext string, opts ...StorageType) OutConfig {
+	o := OutConfig{Ext: ext}
 	if len(opts) > 0 {
 		o.StorageType = &opts[0]
 	}
@@ -106,7 +106,7 @@ func Out(ext string, opts ...StorageType) OutOption {
 }
 
 // getStorageType returns the storage type, using session default if not specified
-func (o OutOption) getStorageType(sessionDefault StorageType) StorageType {
+func (o OutConfig) getStorageType(sessionDefault StorageType) StorageType {
 	if o.StorageType != nil {
 		return *o.StorageType
 	}
@@ -177,22 +177,22 @@ func (m *MultipartReader) Open() (io.ReadCloser, error) { return m.File.Open() }
 func (m *MultipartReader) Cleanup() error               { return nil }
 
 /* -------------------------------------------------------------------------- */
-/*                                 IOReader                                    */
+/*                                 GenericReader                                    */
 /* -------------------------------------------------------------------------- */
 
-// IOReader wraps an uploaded io.Reader.
+// GenericReader wraps an uploaded io.Reader.
 // Cleanup() does nothing because frameworks handle their own temp files.
-type IOReader struct {
+type GenericReader struct {
 	File io.Reader
 }
 
-func NewIOReader(r io.Reader) *IOReader {
-	return &IOReader{File: r}
+func NewGenericReader(r io.Reader) *GenericReader {
+	return &GenericReader{File: r}
 }
 
-func (m *IOReader) Open() (io.ReadCloser, error) {
+func (m *GenericReader) Open() (io.ReadCloser, error) {
 	if m.File == nil {
-		return nil, fmt.Errorf("sio: IOReader: underlying reader is nil")
+		return nil, fmt.Errorf("sio: GenericReader: underlying reader is nil")
 	}
 
 	if rc, ok := m.File.(io.ReadCloser); ok {
@@ -202,7 +202,7 @@ func (m *IOReader) Open() (io.ReadCloser, error) {
 	return io.NopCloser(m.File), nil
 }
 
-func (m *IOReader) Cleanup() error { return nil }
+func (m *GenericReader) Cleanup() error { return nil }
 
 /* -------------------------------------------------------------------------- */
 /*                                BytesReader                                  */
@@ -337,8 +337,8 @@ func NewIoManager(baseDir string, storageType ...StorageType) (IoManager, error)
 		st = storageType[0]
 	}
 
-	// For StorageBytes, we don't need a directory
-	if st == StorageBytes {
+	// For StorageMemory, we don't need a directory
+	if st == StorageMemory {
 		return &manager{
 			baseDir:     "",
 			storageType: st,
@@ -384,8 +384,8 @@ func (m *manager) NewSession() (IoSession, error) {
 		return nil, ErrIoManagerClosed
 	}
 
-	// For StorageBytes mode, no directory is needed
-	if m.storageType == StorageBytes {
+	// For StorageMemory mode, no directory is needed
+	if m.storageType == StorageMemory {
 		return &ioSession{
 			manager:     m,
 			dir:         "",
@@ -437,8 +437,8 @@ type IoSession interface {
 	Read(ctx context.Context, source StreamReader, fn ReadFunc) error
 	ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) error
 
-	Process(ctx context.Context, source StreamReader, out OutOption, fn ProcessFunc) (*Output, error)
-	ProcessList(ctx context.Context, sources []StreamReader, out OutOption, fn ProcessListFunc) (*Output, error)
+	Process(ctx context.Context, source StreamReader, out OutConfig, fn ProcessFunc) (*Output, error)
+	ProcessList(ctx context.Context, sources []StreamReader, out OutConfig, fn ProcessListFunc) (*Output, error)
 
 	Cleanup() error
 }
@@ -479,13 +479,13 @@ func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// For StorageBytes mode, create an in-memory output
-	if storageType == StorageBytes {
+	// For StorageMemory mode, create an in-memory output
+	if storageType == StorageMemory {
 		out := &Output{
 			path:        "",
 			ses:         s,
 			data:        nil,
-			storageType: StorageBytes,
+			storageType: StorageMemory,
 		}
 		s.outputs = append(s.outputs, out)
 		return out, nil
@@ -526,7 +526,7 @@ func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*
 func (s *ioSession) Process(
 	ctx context.Context,
 	source StreamReader,
-	out OutOption,
+	out OutConfig,
 	fn ProcessFunc,
 ) (*Output, error) {
 	if source == nil {
@@ -572,7 +572,7 @@ func (s *ioSession) Process(
 func (s *ioSession) ProcessList(
 	ctx context.Context,
 	sources []StreamReader,
-	out OutOption,
+	out OutConfig,
 	fn ProcessListFunc,
 ) (*Output, error) {
 	if len(sources) == 0 {
@@ -691,8 +691,8 @@ func (s *ioSession) Cleanup() error {
 	}
 	s.closed = true
 
-	// For StorageBytes mode, just clean up in-memory outputs
-	if s.storageType == StorageBytes {
+	// For StorageMemory mode, just clean up in-memory outputs
+	if s.storageType == StorageMemory {
 		var firstErr error
 		for _, out := range s.outputs {
 			out.mu.Lock()
@@ -783,7 +783,7 @@ type Output struct {
 	keep         bool
 	detachedPath string // file copied outside the session dir (for detached use)
 
-	// For StorageBytes mode
+	// For StorageMemory mode
 	data        []byte
 	storageType StorageType
 }
@@ -809,8 +809,8 @@ func (o *Output) OpenReader() (io.ReadCloser, error) {
 		return nil, fmt.Errorf("sio: output is cleaned up")
 	}
 
-	// For StorageBytes mode, return reader from memory
-	if o.storageType == StorageBytes {
+	// For StorageMemory mode, return reader from memory
+	if o.storageType == StorageMemory {
 		if o.data == nil {
 			return io.NopCloser(bytes.NewReader([]byte{})), nil
 		}
@@ -829,8 +829,8 @@ func (o *Output) OpenWriter() (io.WriteCloser, error) {
 		return nil, fmt.Errorf("sio: output is cleaned up")
 	}
 
-	// For StorageBytes mode, return pooled buffer writer
-	if o.storageType == StorageBytes {
+	// For StorageMemory mode, return pooled buffer writer
+	if o.storageType == StorageMemory {
 		buf := bytesBufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		return &bytesWriteCloser{
@@ -848,7 +848,7 @@ func (o *Output) Reader(opts ...InOption) StreamReader {
 	defer o.mu.Unlock()
 
 	var sr StreamReader
-	if o.storageType == StorageBytes {
+	if o.storageType == StorageMemory {
 		sr = NewBytesReader(o.data)
 	} else {
 		sr = NewFileReader(o.path)
@@ -860,13 +860,13 @@ func (o *Output) Reader(opts ...InOption) StreamReader {
 	return sr
 }
 
-// Data returns the raw bytes for StorageBytes mode.
+// Data returns the raw bytes for StorageMemory mode.
 // Returns nil for StorageFile mode.
 // The returned slice is owned by Output - do not modify.
 func (o *Output) Data() []byte {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.storageType == StorageBytes {
+	if o.storageType == StorageMemory {
 		return o.data
 	}
 	return nil
@@ -884,8 +884,8 @@ func (o *Output) cleanup() error {
 
 	var errs error
 
-	// For StorageBytes mode, just clear the data
-	if o.storageType == StorageBytes {
+	// For StorageMemory mode, just clear the data
+	if o.storageType == StorageMemory {
 		o.data = nil
 		return nil
 	}
@@ -1031,8 +1031,8 @@ func In(sr StreamReader, opts ...InOption) StreamReader {
 /* -------------------------------------------------------------------------- */
 
 // NewPartReader wraps multipart.Part as StreamReader (streaming, no buffering).
-func NewPartReader(p *multipart.Part) *IOReader {
-	return NewIOReader(p)
+func NewPartReader(p *multipart.Part) *GenericReader {
+	return NewGenericReader(p)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1269,7 +1269,7 @@ func ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) erro
 }
 
 // Process is a convenience wrapper for IoSession.Process.
-func Process(ctx context.Context, source StreamReader, out OutOption, fn ProcessFunc) (*Output, error) {
+func Process(ctx context.Context, source StreamReader, out OutConfig, fn ProcessFunc) (*Output, error) {
 	if source == nil {
 		return nil, ErrNilSource
 	}
@@ -1286,7 +1286,7 @@ func Process(ctx context.Context, source StreamReader, out OutOption, fn Process
 }
 
 // ProcessList is a convenience wrapper for IoSession.ProcessList.
-func ProcessList(ctx context.Context, sources []StreamReader, out OutOption, fn ProcessListFunc) (*Output, error) {
+func ProcessList(ctx context.Context, sources []StreamReader, out OutConfig, fn ProcessListFunc) (*Output, error) {
 	if len(sources) == 0 {
 		return nil, ErrNilSource
 	}
@@ -1350,7 +1350,7 @@ func ReadListResult[T any](ctx context.Context, sources []StreamReader, fn func(
 	return result, nil
 }
 
-func ProcessResult[T any](ctx context.Context, source StreamReader, out OutOption, fn func(ctx context.Context, r io.Reader, w io.Writer) (*T, error)) (*Output, *T, error) {
+func ProcessResult[T any](ctx context.Context, source StreamReader, out OutConfig, fn func(ctx context.Context, r io.Reader, w io.Writer) (*T, error)) (*Output, *T, error) {
 	if source == nil {
 		return nil, nil, ErrNilSource
 	}
@@ -1378,7 +1378,7 @@ func ProcessResult[T any](ctx context.Context, source StreamReader, out OutOptio
 	return output, result, nil
 }
 
-func ProcessListResult[T any](ctx context.Context, sources []StreamReader, out OutOption, fn func(ctx context.Context, readers []io.Reader, w io.Writer) (*T, error)) (*Output, *T, error) {
+func ProcessListResult[T any](ctx context.Context, sources []StreamReader, out OutConfig, fn func(ctx context.Context, readers []io.Reader, w io.Writer) (*T, error)) (*Output, *T, error) {
 	if len(sources) == 0 {
 		return nil, nil, fmt.Errorf("sio: ProcessListResult: empty sources")
 	}
@@ -1406,7 +1406,7 @@ func ProcessListResult[T any](ctx context.Context, sources []StreamReader, out O
 	return output, result, nil
 }
 
-func ToOutput(ctx context.Context, src StreamReader, out OutOption) (*Output, error) {
+func ToOutput(ctx context.Context, src StreamReader, out OutConfig) (*Output, error) {
 	return Process(ctx, src, out, func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := copyStream(w, r)
 		return err
@@ -1447,9 +1447,9 @@ func WriteStreamToFile(src StreamReader, path string) (int64, error) {
 	return WriteFile(rc, path)
 }
 
-type LineFn func(line string) error
+type LineFunc func(line string) error
 
-func ReadLines(ctx context.Context, src StreamReader, fn LineFn) error {
+func ReadLines(ctx context.Context, src StreamReader, fn LineFunc) error {
 	if src == nil {
 		return ErrNilSource
 	}
@@ -1473,14 +1473,14 @@ func ReadLines(ctx context.Context, src StreamReader, fn LineFn) error {
 	})
 }
 
-func ReadFileLines(ctx context.Context, path string, fn LineFn) error {
+func ReadFileLines(ctx context.Context, path string, fn LineFunc) error {
 	src := NewFileReader(path)
 	return ReadLines(ctx, src, fn)
 }
 
-func GetFileSize(ctx context.Context, source StreamReader) (int64, error) {
+func Size(ctx context.Context, source StreamReader) (int64, error) {
 	fileSize, err := ReadResult[int64](ctx, source, func(ctx context.Context, r io.Reader) (*int64, error) {
-		fileSize := GetFileSizeByReader(r)
+		fileSize := SizeFromReader(r)
 		return &fileSize, nil
 	})
 	if err != nil {
@@ -1489,7 +1489,7 @@ func GetFileSize(ctx context.Context, source StreamReader) (int64, error) {
 	return *fileSize, nil
 }
 
-func GetFileSizeByReader(r io.Reader) int64 {
+func SizeFromReader(r io.Reader) int64 {
 	switch v := r.(type) {
 	case *os.File:
 		if fi, err := v.Stat(); err == nil {
@@ -1501,7 +1501,7 @@ func GetFileSizeByReader(r io.Reader) int64 {
 	return -1
 }
 
-func GetFileSizeByPath(path string) (int64, error) {
+func SizeFromPath(path string) (int64, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return 0, err
