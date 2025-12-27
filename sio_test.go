@@ -714,7 +714,7 @@ func TestCopyOutputTo(t *testing.T) {
 	})
 
 	var buf bytes.Buffer
-	n, err := CopyOutputTo(out, &buf)
+	n, err := out.WriteTo(&buf)
 	if err != nil {
 		t.Fatalf("CopyOutputTo: %v", err)
 	}

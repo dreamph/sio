@@ -29,7 +29,12 @@ const (
 	Excel = ".xlsx"
 	Docx  = ".docx"
 	Pptx  = ".pptx"
+	Zip   = ".zip"
 )
+
+func ToExt(format string) string {
+	return "." + format
+}
 
 /* ---------- Errors ---------- */
 
@@ -190,7 +195,7 @@ func (m *MultipartReader) Open() (io.ReadCloser, error) { return m.File.Open() }
 func (m *MultipartReader) Cleanup() error               { return nil }
 
 /* -------------------------------------------------------------------------- */
-/*                                 GenericReader                                    */
+/*                                 GenericReader                               */
 /* -------------------------------------------------------------------------- */
 
 // GenericReader wraps an uploaded io.Reader.
@@ -777,13 +782,11 @@ func (b *bytesWriteCloser) Close() error {
 // Output represents a file produced by a IoSession.Process call.
 // It can be kept beyond session cleanup via Output.Keep().
 type Output struct {
-	mu           sync.Mutex
-	path         string
-	ses          IoSession
-	closed       bool
-	keep         bool
-	detachedPath string // file copied outside the session dir (for detached use)
-
+	mu     sync.Mutex
+	path   string
+	ses    IoSession
+	closed bool
+	keep   bool
 	// For StorageMemory mode
 	data        []byte
 	storageType StorageType
@@ -876,26 +879,16 @@ func (o *Output) cleanup() error {
 	}
 	o.closed = true
 
-	var errs error
-
-	// For StorageMemory mode, just clear the data
 	if o.storageType == StorageMemory {
 		o.data = nil
 		return nil
 	}
 
-	// For StorageFile mode, remove the files
-	if err := os.Remove(o.path); err != nil && !os.IsNotExist(err) {
-		errs = errors.Join(errs, err)
+	err := os.Remove(o.path)
+	if os.IsNotExist(err) {
+		return nil
 	}
-
-	if o.detachedPath != "" {
-		if err := os.Remove(o.detachedPath); err != nil && !os.IsNotExist(err) {
-			errs = errors.Join(errs, err)
-		}
-	}
-
-	return errs
+	return err
 }
 
 // Keep marks the output file as persistent.
@@ -937,7 +930,7 @@ func (o *Output) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 	defer r.Close()
-	return copyStream(w, r)
+	return Copy(w, r)
 }
 
 func (o *Output) AsReaderAt(ctx context.Context, opts ...ToReaderAtOption) (*ReaderAtResult, error) {
@@ -1208,41 +1201,6 @@ func Session(ctx context.Context) IoSession {
 /*                         Package-level Functions                             */
 /* -------------------------------------------------------------------------- */
 
-func readDirect(ctx context.Context, source StreamReader, fn ReadFunc) error {
-	if source == nil {
-		return ErrNilSource
-	}
-	if fn == nil {
-		return fmt.Errorf("sio: Read: fn is nil")
-	}
-
-	r, err := source.Open()
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrOpenFailed, err)
-	}
-	defer r.Close()
-	defer source.Cleanup()
-
-	return fn(ctx, r)
-}
-
-func readListDirect(ctx context.Context, sources []StreamReader, fn ReadListFunc) error {
-	if len(sources) == 0 {
-		return ErrNilSource
-	}
-	if fn == nil {
-		return fmt.Errorf("sio: ReadList: fn is nil")
-	}
-
-	rl, err := OpenReaderList(sources)
-	if err != nil {
-		return err
-	}
-	defer rl.Close()
-
-	return fn(ctx, rl.Readers)
-}
-
 // Read is a convenience wrapper that gets IoSession from context
 // and calls ses.Read(...). If there is no session, it falls back
 // to direct streaming from the StreamReader.
@@ -1254,12 +1212,19 @@ func Read(ctx context.Context, source StreamReader, fn ReadFunc) error {
 		return fmt.Errorf("sio: Read: fn is nil")
 	}
 
-	ses := Session(ctx)
-	if ses != nil {
+	if ses := Session(ctx); ses != nil {
 		return ses.Read(ctx, source, fn)
 	}
 
-	return readDirect(ctx, source, fn)
+	// direct read
+	r, err := source.Open()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrOpenFailed, err)
+	}
+	defer r.Close()
+	defer source.Cleanup()
+
+	return fn(ctx, r)
 }
 
 // ReadList is a convenience wrapper for IoSession.ReadList.
@@ -1271,12 +1236,18 @@ func ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) erro
 		return fmt.Errorf("sio: ReadList: fn is nil")
 	}
 
-	ses := Session(ctx)
-	if ses != nil {
+	if ses := Session(ctx); ses != nil {
 		return ses.ReadList(ctx, sources, fn)
 	}
 
-	return readListDirect(ctx, sources, fn)
+	// direct read
+	rl, err := OpenReaderList(sources)
+	if err != nil {
+		return err
+	}
+	defer rl.Close()
+
+	return fn(ctx, rl.Readers)
 }
 
 // Process is a convenience wrapper for IoSession.Process.
@@ -1419,21 +1390,9 @@ func ProcessListResult[T any](ctx context.Context, sources []StreamReader, out O
 
 func ToOutput(ctx context.Context, src StreamReader, out OutConfig) (*Output, error) {
 	return Process(ctx, src, out, func(ctx context.Context, r io.Reader, w io.Writer) error {
-		_, err := copyStream(w, r)
+		_, err := Copy(w, r)
 		return err
 	})
-}
-
-func CopyOutputTo(out *Output, w io.Writer) (int64, error) {
-	sr := out.Reader()
-	rc, err := sr.Open()
-	if err != nil {
-		return 0, err
-	}
-	defer rc.Close()
-	defer sr.Cleanup()
-
-	return copyStream(w, rc)
 }
 
 func WriteFile(r io.Reader, path string) (int64, error) {
@@ -1525,10 +1484,6 @@ func SizeFromPath(path string) (int64, error) {
 /* -------------------------------------------------------------------------- */
 
 func Copy(dst io.Writer, src io.Reader) (int64, error) {
-	return copyStream(dst, src)
-}
-
-func copyStream(dst io.Writer, src io.Reader) (int64, error) {
 	return io.Copy(dst, src)
 }
 
@@ -1543,11 +1498,9 @@ func copyToFile(src io.Reader, dstPath string) (int64, error) {
 	}
 	defer f.Close()
 
-	return copyStream(f, src)
+	return Copy(f, src)
 }
 
-// ReaderAtResult is the result of converting an arbitrary io.Reader
-// into something that supports random random-access reads.
 type ReaderAtResult struct {
 	ReaderAt io.ReaderAt
 	Size     int64
@@ -1692,7 +1645,7 @@ func spoolToTempFile(r io.Reader, dir, pattern string) (*ReaderAtResult, error) 
 		return nil, err
 	}
 
-	n, err := copyStream(tmp, r)
+	n, err := Copy(tmp, r)
 	if err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
@@ -1738,7 +1691,7 @@ func spillWithPrefix(r io.Reader, prefix []byte, dir, pattern string) (*ReaderAt
 	}
 
 	// Write remaining stream
-	n2, err := copyStream(tmp, r)
+	n2, err := Copy(tmp, r)
 	if err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
@@ -1774,20 +1727,13 @@ func minInt64(a, b int64) int64 {
 /*                                  Types                                      */
 /* -------------------------------------------------------------------------- */
 
-// DoFunc is executed after all readers are successfully opened.
-type DoFunc func(ctx context.Context) error
-
-// UseReader is a lazy io.Reader that becomes usable after binder.open().
-// It is safe to pass around and use inside Do().
+// UseReader wraps an opened io.Reader from Binder.
 type UseReader struct {
-	r      io.Reader
-	err    error
-	binder *Binder
-	idx    int
+	r   io.Reader
+	err error
 }
 
 // Read implements io.Reader.
-// Returns error if accessed before Do/open or if setup failed.
 func (ur *UseReader) Read(p []byte) (int, error) {
 	if ur == nil {
 		return 0, errors.New("sio: nil UseReader")
@@ -1795,32 +1741,16 @@ func (ur *UseReader) Read(p []byte) (int, error) {
 	if ur.err != nil {
 		return 0, ur.err
 	}
-	if ur.binder != nil && !ur.binder.opened {
-		return 0, errors.New("sio: reader accessed before Do()")
-	}
-	// lazy bind to underlying opened reader
-	if ur.r == nil && ur.binder != nil && ur.idx >= 0 && ur.idx < len(ur.binder.readers) {
-		ur.r = ur.binder.readers[ur.idx]
-	}
 	if ur.r == nil {
 		return 0, errors.New("sio: reader not opened")
 	}
 	return ur.r.Read(p)
 }
 
-// Unwrap returns underlying io.Reader (nil if not ready or error).
+// Unwrap returns underlying io.Reader (nil if error).
 func (ur *UseReader) Unwrap() io.Reader {
-	if ur == nil {
+	if ur == nil || ur.err != nil {
 		return nil
-	}
-	if ur.err != nil {
-		return nil
-	}
-	if ur.binder != nil && !ur.binder.opened {
-		return nil
-	}
-	if ur.r == nil && ur.binder != nil && ur.idx >= 0 && ur.idx < len(ur.binder.readers) {
-		ur.r = ur.binder.readers[ur.idx]
 	}
 	return ur.r
 }
@@ -1840,90 +1770,64 @@ var _ io.Reader = (*UseReader)(nil)
 /*                                  Binder                                     */
 /* -------------------------------------------------------------------------- */
 
-// Binder collects StreamReaders and opens them all at once before executing Do().
+// Binder collects StreamReaders and opens them eagerly on registration.
 type Binder struct {
-	pending  []StreamReader
-	readers  []io.Reader
-	closers  []io.Closer
-	sources  []StreamReader
-	opened   bool
-	doCalled bool
-	err      error
+	mu      sync.Mutex
+	readers []io.Reader
+	closers []io.Closer
+	sources []StreamReader
+	err     error
 }
 
-// Reader registers a StreamReader to be opened later.
-// Must be called before Do() (or helpers that call Do()).
-func (b *Binder) Reader(sr StreamReader) *UseReader {
+// openReader registers and immediately opens a StreamReader.
+// Returns a UseReader that wraps the opened io.Reader.
+func (b *Binder) openReader(sr StreamReader) *UseReader {
 	if b == nil {
 		return &UseReader{err: errors.New("sio: nil binder")}
 	}
-	if b.doCalled {
-		if b.err == nil {
-			b.err = errors.New("sio: Reader() called after Do()")
-		}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// If previous error occurred, return error reader
+	if b.err != nil {
 		return &UseReader{err: b.err}
 	}
 
-	idx := len(b.pending)
-	b.pending = append(b.pending, sr)
+	if sr == nil {
+		b.err = fmt.Errorf("sio: source #%d is nil", len(b.readers)+1)
+		return &UseReader{err: b.err}
+	}
+
+	// Eager open: open immediately
+	rc, err := sr.Open()
+	if err != nil {
+		b.err = fmt.Errorf("sio: source #%d: %w: %v", len(b.readers)+1, ErrOpenFailed, err)
+		return &UseReader{err: b.err}
+	}
+
+	b.readers = append(b.readers, rc)
+	b.closers = append(b.closers, rc)
+	b.sources = append(b.sources, sr)
 
 	return &UseReader{
-		binder: b,
-		idx:    idx,
+		r: rc,
 	}
 }
 
-// Do marks the end of Reader phase and returns the function to be executed
-// after all readers are opened.
-func (b *Binder) Do(ctx context.Context, fn func(ctx context.Context) error) DoFunc {
-	if b == nil {
-		return func(ctx context.Context) error { return errors.New("sio: nil binder") }
-	}
-	if fn == nil {
-		if b.err == nil {
-			b.err = errors.New("sio: Do: fn is nil")
-		}
-		return func(ctx context.Context) error { return b.err }
-	}
-	if b.doCalled {
-		if b.err == nil {
-			b.err = errors.New("sio: Do() called twice")
-		}
-	}
-	b.doCalled = true
-	return fn
-}
-
-// open opens all registered StreamReaders.
-// Returns the first error encountered.
-func (b *Binder) open() error {
-	if b == nil {
-		return errors.New("sio: nil binder")
-	}
-	if b.err != nil {
-		return b.err
+// Use is a convenience wrapper around Reader that returns io.Reader directly.
+// If opening fails, Binder.err is set and nil is returned.
+func (b *Binder) Use(sr StreamReader) (io.Reader, error) {
+	ur := b.openReader(sr)
+	if ur == nil {
+		return nil, fmt.Errorf("sio: nil UseReader")
 	}
 
-	if len(b.pending) == 0 {
-		b.opened = true
-		return nil
+	if err := ur.Err(); err != nil {
+		return nil, err
 	}
 
-	b.readers = make([]io.Reader, len(b.pending))
-	for i, sr := range b.pending {
-		if sr == nil {
-			return fmt.Errorf("sio: source #%d is nil", i+1)
-		}
-		rc, err := sr.Open()
-		if err != nil {
-			return fmt.Errorf("sio: source #%d: %w: %v", i+1, ErrOpenFailed, err)
-		}
-		b.readers[i] = rc
-		b.closers = append(b.closers, rc)
-		b.sources = append(b.sources, sr)
-	}
-	b.opened = true
-	return nil
+	return ur.Unwrap(), nil
 }
 
 // cleanup closes all opened readers and cleans up all sources.
@@ -1931,6 +1835,9 @@ func (b *Binder) cleanup() {
 	if b == nil {
 		return
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	for _, c := range b.closers {
 		if c != nil {
 			_ = c.Close()
@@ -1946,75 +1853,23 @@ func (b *Binder) cleanup() {
 	b.readers = nil
 }
 
-// Err returns any error that occurred during Reader/Do phase.
+// Err returns any error that occurred during registration.
 func (b *Binder) Err() error {
 	if b == nil {
 		return errors.New("sio: nil binder")
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.err
 }
 
 /* -------------------------------------------------------------------------- */
-/*                          DoResult (generic helpers)                         */
-/* -------------------------------------------------------------------------- */
-func doResult[T any](
-	b *Binder,
-	ctx context.Context,
-	out **T,
-	fn func(ctx context.Context) (*T, error),
-) DoFunc {
-	if b == nil {
-		return func(ctx context.Context) error {
-			return errors.New("sio: DoResult: nil binder")
-		}
-	}
-	if out == nil {
-		if b.err == nil {
-			b.err = errors.New("sio: DoResult: out is nil")
-		}
-		return func(ctx context.Context) error { return b.err }
-	}
-	if fn == nil {
-		if b.err == nil {
-			b.err = errors.New("sio: DoResult: fn is nil")
-		}
-		return func(ctx context.Context) error { return b.err }
-	}
-
-	return b.Do(ctx, func(ctx context.Context) error {
-		v, err := fn(ctx)
-		if err != nil {
-			return err
-		}
-		*out = v
-		return nil
-	})
-}
-
-// DoResult is sugar: returns (resultPtr, DoFunc).
-func DoResult[T any](
-	ctx context.Context,
-	b *Binder,
-	fn func(ctx context.Context) (*T, error),
-) (*T, DoFunc) {
-	var out *T
-	return out, doResult[T](b, ctx, &out, fn)
-}
-
-func Do(ctx context.Context, b *Binder, fn func(ctx context.Context) error) DoFunc {
-	if b == nil {
-		return func(ctx context.Context) error { return errors.New("sio: Do: nil binder") }
-	}
-	return b.Do(ctx, fn)
-}
-
-/* -------------------------------------------------------------------------- */
-/*                              Binder Functions                               */
+/*                          Bind* (refactored API)                             */
 /* -------------------------------------------------------------------------- */
 
-// BindRead opens multiple StreamReaders and executes fn after all are opened.
+// BindRead opens multiple StreamReaders lazily through Binder and executes fn.
 // This is standalone (no session required).
-func BindRead(ctx context.Context, fn func(ctx context.Context, b *Binder) DoFunc) error {
+func BindRead(ctx context.Context, fn func(ctx context.Context, b *Binder) error) error {
 	if fn == nil {
 		return errors.New("sio: BindRead: fn is nil")
 	}
@@ -2022,21 +1877,12 @@ func BindRead(ctx context.Context, fn func(ctx context.Context, b *Binder) DoFun
 	b := &Binder{}
 	defer b.cleanup()
 
-	doFn := fn(ctx, b)
-
-	if err := b.open(); err != nil {
-		return err
-	}
-
-	if doFn != nil {
-		return doFn(ctx)
-	}
-	return nil
+	return fn(ctx, b)
 }
 
-// BindProcess opens multiple StreamReaders, creates an output, and executes fn.
+// BindProcess opens multiple StreamReaders lazily, creates an output, and executes fn.
 // Requires a session in context.
-func BindProcess(ctx context.Context, out OutConfig, fn func(ctx context.Context, b *Binder, w io.Writer) DoFunc) (*Output, error) {
+func BindProcess(ctx context.Context, out OutConfig, fn func(ctx context.Context, b *Binder, w io.Writer) error) (*Output, error) {
 	if fn == nil {
 		return nil, errors.New("sio: BindProcess: fn is nil")
 	}
@@ -2046,13 +1892,13 @@ func BindProcess(ctx context.Context, out OutConfig, fn func(ctx context.Context
 		return nil, ErrNoSession
 	}
 
-	b := &Binder{}
-	defer b.cleanup()
-
 	iSes, ok := ses.(*ioSession)
 	if !ok {
 		return nil, ErrInvalidSessionType
 	}
+
+	b := &Binder{}
+	defer b.cleanup()
 
 	output, err := iSes.newOutputWithStorage(out.Ext, out.getStorageType(iSes.storageType))
 	if err != nil {
@@ -2064,38 +1910,18 @@ func BindProcess(ctx context.Context, out OutConfig, fn func(ctx context.Context
 		_ = output.cleanup()
 		return nil, err
 	}
+	defer w.Close()
 
-	// Phase 1: register readers
-	doFn := fn(ctx, b, w)
-
-	// Phase 2: open all readers
-	if err := b.open(); err != nil {
-		_ = w.Close()
+	if err := fn(ctx, b, w); err != nil {
 		_ = output.cleanup()
 		return nil, err
-	}
-
-	// Phase 3: execute
-	var execErr error
-	if doFn != nil {
-		execErr = doFn(ctx)
-	}
-
-	// Close writer before checking error
-	if closeErr := w.Close(); closeErr != nil && execErr == nil {
-		execErr = closeErr
-	}
-
-	if execErr != nil {
-		_ = output.cleanup()
-		return nil, execErr
 	}
 
 	return output, nil
 }
 
 // BindProcessResult is like BindProcess but also returns a result value.
-func BindProcessResult[T any](ctx context.Context, out OutConfig, fn func(ctx context.Context, b *Binder, w io.Writer) (*T, DoFunc)) (*Output, *T, error) {
+func BindProcessResult[T any](ctx context.Context, out OutConfig, fn func(ctx context.Context, b *Binder, w io.Writer) (*T, error)) (*Output, *T, error) {
 	if fn == nil {
 		return nil, nil, errors.New("sio: BindProcessResult: fn is nil")
 	}
@@ -2105,13 +1931,13 @@ func BindProcessResult[T any](ctx context.Context, out OutConfig, fn func(ctx co
 		return nil, nil, ErrNoSession
 	}
 
-	b := &Binder{}
-	defer b.cleanup()
-
 	iSes, ok := ses.(*ioSession)
 	if !ok {
 		return nil, nil, ErrInvalidSessionType
 	}
+
+	b := &Binder{}
+	defer b.cleanup()
 
 	output, err := iSes.newOutputWithStorage(out.Ext, out.getStorageType(iSes.storageType))
 	if err != nil {
@@ -2123,38 +1949,19 @@ func BindProcessResult[T any](ctx context.Context, out OutConfig, fn func(ctx co
 		_ = output.cleanup()
 		return nil, nil, err
 	}
+	defer w.Close()
 
-	// Phase 1: register readers + get (resultPtr, doFn)
-	result, doFn := fn(ctx, b, w)
-
-	// Phase 2: open all readers
-	if err := b.open(); err != nil {
-		_ = w.Close()
-		_ = output.cleanup()
-		return nil, nil, err
-	}
-
-	// Phase 3: execute
-	var execErr error
-	if doFn != nil {
-		execErr = doFn(ctx)
-	}
-
-	// Close writer before checking error
-	if closeErr := w.Close(); closeErr != nil && execErr == nil {
-		execErr = closeErr
-	}
-
+	res, execErr := fn(ctx, b, w)
 	if execErr != nil {
 		_ = output.cleanup()
 		return nil, nil, execErr
 	}
 
-	return output, result, nil
+	return output, res, nil
 }
 
 // BindReadResult is like BindRead but also returns a result value.
-func BindReadResult[T any](ctx context.Context, fn func(ctx context.Context, b *Binder) (*T, DoFunc)) (*T, error) {
+func BindReadResult[T any](ctx context.Context, fn func(ctx context.Context, b *Binder) (*T, error)) (*T, error) {
 	if fn == nil {
 		return nil, errors.New("sio: BindReadResult: fn is nil")
 	}
@@ -2162,31 +1969,5 @@ func BindReadResult[T any](ctx context.Context, fn func(ctx context.Context, b *
 	b := &Binder{}
 	defer b.cleanup()
 
-	// Phase 1: register readers + get (resultPtr, doFn)
-	result, doFn := fn(ctx, b)
-
-	// Phase 2: open all readers
-	if err := b.open(); err != nil {
-		return nil, err
-	}
-
-	// Phase 3: execute
-	if doFn != nil {
-		if err := doFn(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	return result, nil
+	return fn(ctx, b)
 }
-
-/* -------------------------------------------------------------------------- */
-/*                           Convenience Aliases                               */
-/* -------------------------------------------------------------------------- */
-
-type (
-	BindReadFunc                 = func(ctx context.Context, b *Binder) DoFunc
-	BindProcessFunc              = func(ctx context.Context, b *Binder, w io.Writer) DoFunc
-	BindReadResultFunc[T any]    = func(ctx context.Context, b *Binder) (*T, DoFunc)
-	BindProcessResultFunc[T any] = func(ctx context.Context, b *Binder, w io.Writer) (*T, DoFunc)
-)
