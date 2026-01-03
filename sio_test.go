@@ -56,10 +56,10 @@ func TestStorageFunction(t *testing.T) {
 func TestOutOption(t *testing.T) {
 	t.Run("without storage type", func(t *testing.T) {
 		opt := Out(".pdf")
-		if opt.Ext != ".pdf" {
-			t.Errorf("Ext = %q, want %q", opt.Ext, ".pdf")
+		if opt.Ext() != ".pdf" {
+			t.Errorf("Ext = %q, want %q", opt.Ext(), ".pdf")
 		}
-		if opt.StorageType != nil {
+		if opt.StorageType() != nil {
 			t.Error("StorageType should be nil")
 		}
 		// Should use session default
@@ -73,14 +73,14 @@ func TestOutOption(t *testing.T) {
 
 	t.Run("with memory storage", func(t *testing.T) {
 		opt := Out(".pdf", Memory)
-		if opt.Ext != ".pdf" {
-			t.Errorf("Ext = %q, want %q", opt.Ext, ".pdf")
+		if opt.Ext() != ".pdf" {
+			t.Errorf("Ext = %q, want %q", opt.Ext(), ".pdf")
 		}
-		if opt.StorageType == nil {
+		if opt.StorageType() == nil {
 			t.Fatal("StorageType should not be nil")
 		}
-		if *opt.StorageType != StorageMemory {
-			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType)
+		if *opt.StorageType() != StorageMemory {
+			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType())
 		}
 		// Should override session default
 		if got := opt.getStorageType(StorageFile); got != StorageMemory {
@@ -90,15 +90,15 @@ func TestOutOption(t *testing.T) {
 
 	t.Run("with file storage", func(t *testing.T) {
 		opt := Out(".txt", File)
-		if *opt.StorageType != StorageFile {
-			t.Errorf("StorageType = %v, want File", *opt.StorageType)
+		if *opt.StorageType() != StorageFile {
+			t.Errorf("StorageType = %v, want File", *opt.StorageType())
 		}
 	})
 
 	t.Run("with Storage() string conversion", func(t *testing.T) {
 		opt := Out(".pdf", Storage("memory"))
-		if *opt.StorageType != StorageMemory {
-			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType)
+		if *opt.StorageType() != StorageMemory {
+			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType())
 		}
 	})
 }
@@ -856,7 +856,7 @@ func TestBytesReaderCleanup(t *testing.T) {
 
 	br.Cleanup()
 
-	if br.Data != nil {
+	if br.Data() != nil {
 		t.Error("BytesReader.Cleanup should set Data to nil")
 	}
 }
@@ -1090,14 +1090,14 @@ func TestConfigure(t *testing.T) {
 	t.Cleanup(func() { httpClient = old })
 
 	custom := &http.Client{Timeout: 12 * time.Second}
-	if err := Configure(Config{Client: custom}); err != nil {
+	if err := Configure(NewConfig(custom)); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
 	if httpClient != custom {
 		t.Fatalf("httpClient not updated")
 	}
 
-	if err := Configure(Config{}); err != nil {
+	if err := Configure(NewConfig(nil)); err != nil {
 		t.Fatalf("Configure (nil): %v", err)
 	}
 	if httpClient != custom {
@@ -1195,7 +1195,7 @@ func TestURLReader(t *testing.T) {
 				}, nil
 			}),
 		}
-		r := NewURLReader("http://example.com", URLReaderOptions{Client: client})
+		r := NewURLReader("http://example.com", URLReaderOptions{}.WithClient(client))
 		_, err := r.Open()
 		if !errors.Is(err, ErrDownloadFailed) {
 			t.Fatalf("expected ErrDownloadFailed, got %v", err)
@@ -1212,7 +1212,7 @@ func TestURLReader(t *testing.T) {
 				}, nil
 			}),
 		}
-		r := NewURLReader("http://example.com", URLReaderOptions{Client: client})
+		r := NewURLReader("http://example.com", URLReaderOptions{}.WithClient(client))
 		rc, err := r.Open()
 		if err != nil {
 			t.Fatalf("Open: %v", err)
@@ -1230,7 +1230,7 @@ func TestURLReader(t *testing.T) {
 				return nil, errors.New("boom")
 			}),
 		}
-		r := NewURLReader("http://example.com", URLReaderOptions{Client: client})
+		r := NewURLReader("http://example.com", URLReaderOptions{}.WithClient(client))
 		_, err := r.Open()
 		if !errors.Is(err, ErrDownloadFailed) {
 			t.Fatalf("expected ErrDownloadFailed, got %v", err)
@@ -1239,14 +1239,14 @@ func TestURLReader(t *testing.T) {
 
 	t.Run("custom client used", func(t *testing.T) {
 		custom := &http.Client{Timeout: 2 * time.Second}
-		r := NewURLReader("http://example.com", URLReaderOptions{Client: custom})
+		r := NewURLReader("http://example.com", URLReaderOptions{}.WithClient(custom))
 		if r.client != custom {
 			t.Fatalf("expected custom client to be used")
 		}
 	})
 
 	t.Run("insecure tls option sets transport", func(t *testing.T) {
-		r := NewURLReader("https://example.com", URLReaderOptions{InsecureTLS: true})
+		r := NewURLReader("https://example.com", URLReaderOptions{}.WithInsecureTLS(true))
 		tr, ok := r.client.Transport.(*http.Transport)
 		if !ok || tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
 			t.Fatalf("expected InsecureTLS transport")
@@ -1405,7 +1405,7 @@ func TestReaderListCloseAndOpenReaderListErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenReaderList empty: %v", err)
 	}
-	if len(rl.Readers) != 0 {
+	if len(rl.Readers()) != 0 {
 		t.Fatalf("expected empty ReaderList")
 	}
 
@@ -1567,7 +1567,7 @@ func TestToReaderAtVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToReaderAt direct: %v", err)
 	}
-	if direct.Source != "direct" || direct.Size != 3 {
+	if direct.Source() != "direct" || direct.Size() != 3 {
 		t.Fatalf("unexpected direct result: %#v", direct)
 	}
 	_ = direct.Cleanup()
@@ -1576,7 +1576,7 @@ func TestToReaderAtVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToReaderAt memory: %v", err)
 	}
-	if mem.Source != "memory" || mem.Size != 5 {
+	if mem.Source() != "memory" || mem.Size() != 5 {
 		t.Fatalf("unexpected memory result: %#v", mem)
 	}
 
@@ -1585,10 +1585,10 @@ func TestToReaderAtVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToReaderAt temp: %v", err)
 	}
-	if temp.Source != "tempFile" || temp.Size != 4 {
+	if temp.Source() != "tempFile" || temp.Size() != 4 {
 		t.Fatalf("unexpected temp result: %#v", temp)
 	}
-	if f, ok := temp.ReaderAt.(*os.File); ok {
+	if f, ok := temp.ReaderAt().(*os.File); ok {
 		name := f.Name()
 		if err := temp.Cleanup(); err != nil {
 			t.Fatalf("Cleanup: %v", err)
@@ -1602,7 +1602,7 @@ func TestToReaderAtVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToReaderAt spill: %v", err)
 	}
-	if spill.Source != "tempFile" || spill.Size != 10 {
+	if spill.Source() != "tempFile" || spill.Size() != 10 {
 		t.Fatalf("unexpected spill result: %#v", spill)
 	}
 	_ = spill.Cleanup()

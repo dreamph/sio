@@ -88,13 +88,13 @@ func TestToReaderAt_WithBindProcessResult_AndFile(t *testing.T) {
 		defer func() { _ = raRes.Cleanup() }()
 
 		// ✅ CHECK SIZE: input must be known and correct
-		if raRes.Size != int64(len(inputData)) {
-			t.Fatalf("unexpected input size, got=%d want=%d", raRes.Size, len(inputData))
+		if raRes.Size() != int64(len(inputData)) {
+			t.Fatalf("unexpected input size, got=%d want=%d", raRes.Size(), len(inputData))
 		}
 
 		// small sanity read from input via ReaderAt
 		tmp := make([]byte, 5)
-		if _, err := raRes.ReaderAt.ReadAt(tmp, 0); err != nil {
+		if _, err := raRes.ReaderAt().ReadAt(tmp, 0); err != nil {
 			return nil, err
 		}
 		if string(tmp) != "HELLO" {
@@ -133,17 +133,17 @@ func TestToReaderAt_WithBindProcessResult_AndFile(t *testing.T) {
 	}()
 
 	// ✅ CHECK SIZE: output must be known and correct
-	if raOut.Size != int64(len(inputData)) {
-		t.Fatalf("unexpected output size, got=%d want=%d", raOut.Size, len(inputData))
+	if raOut.Size() != int64(len(inputData)) {
+		t.Fatalf("unexpected output size, got=%d want=%d", raOut.Size(), len(inputData))
 	}
 
-	if raOut.Source != "tempFile" && raOut.Source != "memory" && raOut.Source != "direct" {
-		t.Fatalf("unexpected Source: %q", raOut.Source)
+	if raOut.Source() != "tempFile" && raOut.Source() != "memory" && raOut.Source() != "direct" {
+		t.Fatalf("unexpected Source: %q", raOut.Source())
 	}
 
 	// check first bytes of output via ReaderAt
 	buf := make([]byte, 5)
-	if _, err := raOut.ReaderAt.ReadAt(buf, 0); err != nil {
+	if _, err := raOut.ReaderAt().ReadAt(buf, 0); err != nil {
 		t.Fatalf("ReadAt error: %v", err)
 	}
 	if string(buf) != "HELLO" {

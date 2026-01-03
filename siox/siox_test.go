@@ -135,11 +135,11 @@ func TestDoFileDoMultipartDoURL(t *testing.T) {
 			}, nil
 		}),
 	}
-	if err := sio.Configure(sio.Config{Client: custom}); err != nil {
+	if err := sio.Configure(sio.NewConfig(custom)); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = sio.Configure(sio.Config{Client: &http.Client{Timeout: 30 * time.Second}})
+		_ = sio.Configure(sio.NewConfig(&http.Client{Timeout: 30 * time.Second}))
 	})
 
 	out, err = DoURL(ctx, "http://example.com", ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
