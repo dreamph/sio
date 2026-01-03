@@ -21,16 +21,21 @@ import (
 )
 
 const (
-	Pdf   = ".pdf"
-	Text  = ".txt"
-	Csv   = ".csv"
-	Jpg   = ".jpg"
-	Png   = ".png"
-	Excel = ".xlsx"
-	Docx  = ".docx"
-	Pptx  = ".pptx"
-	Zip   = ".zip"
-	Json  = ".json"
+	Json = ".json"
+	Csv  = ".csv"
+	Txt  = ".txt"
+	Xml  = ".xml"
+
+	Pdf  = ".pdf"
+	Docx = ".docx"
+	Xlsx = ".xlsx"
+	Pptx = ".pptx"
+
+	Jpg  = ".jpg"
+	Jpeg = ".jpeg"
+	Png  = ".png"
+
+	Zip = ".zip"
 )
 
 func ToExt(format string) string {

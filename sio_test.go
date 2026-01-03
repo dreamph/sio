@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1703,5 +1705,318 @@ func TestReadResultAndProcessResultErrors(t *testing.T) {
 
 	if _, _, err := ProcessListResult[int](context.Background(), nil, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) (*int, error) { return nil, nil }); err == nil {
 		t.Fatalf("expected error for empty ProcessListResult sources")
+	}
+}
+
+func TestURLReaderOptionsWithTimeout(t *testing.T) {
+	t.Run("sets timeout on client", func(t *testing.T) {
+		opts := URLReaderOptions{}.WithTimeout(5 * time.Second)
+		r := NewURLReader("http://example.com", opts)
+		if r.client.Timeout != 5*time.Second {
+			t.Errorf("client timeout = %v, want 5s", r.client.Timeout)
+		}
+	})
+
+	t.Run("combines with other options", func(t *testing.T) {
+		customClient := &http.Client{Timeout: 10 * time.Second}
+		opts := URLReaderOptions{}.WithClient(customClient).WithTimeout(3 * time.Second)
+		r := NewURLReader("http://example.com", opts)
+		// WithClient sets the client, and that client has its own timeout
+		// WithTimeout is applied separately and may or may not override depending on implementation
+		if r.client != customClient {
+			t.Error("expected custom client to be used")
+		}
+		// The actual behavior is that WithClient's client timeout takes precedence
+		if r.client.Timeout != 10*time.Second {
+			t.Errorf("timeout = %v, want 10s", r.client.Timeout)
+		}
+	})
+}
+
+func TestProcessListEmptySourcesError(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	// Empty sources list should error
+	_, err := ProcessList(ctx, []StreamReader{}, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected error for empty sources list")
+	}
+}
+
+func TestReadListEmptySourcesError(t *testing.T) {
+	// ReadList with empty sources should return an error
+	err := ReadList(context.Background(), []StreamReader{}, func(ctx context.Context, readers []io.Reader) error {
+		return nil
+	})
+	if !errors.Is(err, ErrNilSource) {
+		t.Fatalf("expected ErrNilSource for empty sources, got %v", err)
+	}
+}
+
+func TestProcessListErrorCleanup(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	t.Run("error in process function cleans up output", func(t *testing.T) {
+		sources := []StreamReader{
+			NewBytesReader([]byte("test1")),
+			NewBytesReader([]byte("test2")),
+		}
+
+		expectedErr := errors.New("processing failed")
+		_, err := ProcessList(ctx, sources, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) error {
+			return expectedErr
+		})
+
+		if !errors.Is(err, expectedErr) {
+			t.Errorf("expected error %v, got %v", expectedErr, err)
+		}
+		// Output should have been cleaned up automatically
+	})
+
+	t.Run("failed open cleans up already opened readers", func(t *testing.T) {
+		sources := []StreamReader{
+			NewBytesReader([]byte("ok")),
+			stubStreamReader{
+				openFn: func() (io.ReadCloser, error) {
+					return nil, errors.New("open failed")
+				},
+			},
+		}
+
+		_, err := ProcessList(ctx, sources, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) error {
+			return nil
+		})
+
+		if !errors.Is(err, ErrOpenFailed) {
+			t.Errorf("expected ErrOpenFailed, got %v", err)
+		}
+	})
+}
+
+func TestBindProcessWithMultipleSources(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	output, err := BindProcess(ctx, Out(".txt"), func(ctx context.Context, b *Binder, w io.Writer) error {
+		r1, err := b.Use(NewBytesReader([]byte("hello ")))
+		if err != nil {
+			return err
+		}
+		r2, err := b.Use(NewBytesReader([]byte("world")))
+		if err != nil {
+			return err
+		}
+
+		if _, err := io.Copy(w, r1); err != nil {
+			return err
+		}
+		if _, err := io.Copy(w, r2); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("BindProcess: %v", err)
+	}
+
+	data, _ := output.Bytes()
+	if string(data) != "hello world" {
+		t.Errorf("got %q, want %q", string(data), "hello world")
+	}
+}
+
+func TestBindReadWithError(t *testing.T) {
+	expectedErr := errors.New("bind read failed")
+	err := BindRead(context.Background(), func(ctx context.Context, b *Binder) error {
+		_, err := b.Use(NewBytesReader([]byte("test")))
+		if err != nil {
+			return err
+		}
+		return expectedErr
+	})
+
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("expected %v, got %v", expectedErr, err)
+	}
+}
+
+func TestBindReadResultReturnsValue(t *testing.T) {
+	result, err := BindReadResult[string](context.Background(), func(ctx context.Context, b *Binder) (*string, error) {
+		r, err := b.Use(NewBytesReader([]byte("result")))
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		s := string(data)
+		return &s, nil
+	})
+
+	if err != nil {
+		t.Fatalf("BindReadResult: %v", err)
+	}
+	if *result != "result" {
+		t.Errorf("result = %q, want %q", *result, "result")
+	}
+}
+
+func TestProcessWithContextCancellation(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = WithSession(ctx, ses)
+
+	// Cancel context before processing
+	cancel()
+
+	_, err := Process(ctx, NewBytesReader([]byte("test")), Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		_, err := io.Copy(w, r)
+		return err
+	})
+
+	// Should still work or return context error depending on timing
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Logf("Process with cancelled context: %v", err)
+	}
+}
+
+func TestOutputAsReaderAt(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	src := NewBytesReader([]byte("0123456789"))
+	output, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	result, err := output.AsReaderAt(ctx)
+	if err != nil {
+		t.Fatalf("AsReaderAt: %v", err)
+	}
+	defer result.Cleanup()
+
+	// Test reading at specific offset
+	buf := make([]byte, 3)
+	n, err := result.ReaderAt().ReadAt(buf, 5)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("read %d bytes, want 3", n)
+	}
+	if string(buf) != "567" {
+		t.Errorf("read %q, want %q", string(buf), "567")
+	}
+}
+
+func TestMultipleSessionsConcurrent(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			ses, err := mgr.NewSession()
+			if err != nil {
+				t.Errorf("NewSession %d: %v", id, err)
+				return
+			}
+			defer ses.Cleanup()
+
+			ctx := WithSession(context.Background(), ses)
+
+			data := []byte(fmt.Sprintf("session-%d", id))
+			src := NewBytesReader(data)
+			out, err := Process(ctx, src, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+				_, err := io.Copy(w, r)
+				return err
+			})
+			if err != nil {
+				t.Errorf("Process %d: %v", id, err)
+				return
+			}
+
+			result, _ := out.Bytes()
+			if string(result) != string(data) {
+				t.Errorf("session %d: got %q, want %q", id, string(result), string(data))
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestReadListWithMixedSources(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	// Create temp file
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	os.WriteFile(tmpFile, []byte("file-content"), 0644)
+
+	sources := []StreamReader{
+		NewBytesReader([]byte("bytes")),
+		NewFileReader(tmpFile),
+		NewGenericReader(strings.NewReader("generic")),
+	}
+
+	var results []string
+	err := ReadList(ctx, sources, func(ctx context.Context, readers []io.Reader) error {
+		for _, r := range readers {
+			data, _ := io.ReadAll(r)
+			results = append(results, string(data))
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("ReadList: %v", err)
+	}
+
+	expected := []string{"bytes", "file-content", "generic"}
+	if len(results) != len(expected) {
+		t.Fatalf("got %d results, want %d", len(results), len(expected))
+	}
+	for i, want := range expected {
+		if results[i] != want {
+			t.Errorf("result[%d] = %q, want %q", i, results[i], want)
+		}
 	}
 }

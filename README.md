@@ -192,7 +192,7 @@ output, _ := sio.Process(ctx, src, sio.Out(sio.Jpg), processImage)
 
 ```go
 src := sio.NewURLReader("https://example.com/data.csv")
-output, _ := sio.Process(ctx, src, sio.Out(sio.Excel), convertToExcel)
+output, _ := sio.Process(ctx, src, sio.Out(sio.Xlsx), convertToExcel)
 ```
 
 ### 💾 **Transform Local Files**
@@ -595,11 +595,12 @@ sio.Text   // ".txt"
 sio.Csv    // ".csv"
 sio.Jpg    // ".jpg"
 sio.Png    // ".png"
-sio.Excel  // ".xlsx"
+sio.Xlsx   // ".xlsx"
 sio.Docx   // ".docx"
 sio.Pptx   // ".pptx"
 sio.Zip    // ".zip"
 sio.Json   // ".json"
+sio.Xml    // ".xml"
 
 // Or create your own
 customExt := sio.ToExt("xml") // ".xml"
@@ -622,12 +623,6 @@ customExt := sio.ToExt("xml") // ".xml"
 3. **Practical**: Built for real production workloads, not academic exercises
 4. **Safe**: Proper error handling and resource management built-in
 5. **Flexible**: Choose the trade-offs that make sense for your use case
-
----
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ---
 
