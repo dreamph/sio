@@ -68,7 +68,7 @@ func (r roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 func TestDoAndDoBytes(t *testing.T) {
 	ctx := newSessionCtx(t)
 
-	out, err := Do(ctx, bytes.NewBufferString("hello"), ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err := Do(ctx, bytes.NewBufferString("hello"), sio.Out(sio.Text), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
@@ -80,7 +80,7 @@ func TestDoAndDoBytes(t *testing.T) {
 		t.Fatalf("Do got %q", string(data))
 	}
 
-	out, err = DoBytes(ctx, []byte("bytes"), ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err = DoBytes(ctx, []byte("bytes"), sio.Out(sio.Text), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
@@ -101,7 +101,7 @@ func TestDoFileDoMultipartDoURL(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	out, err := DoFile(ctx, path, ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err := DoFile(ctx, path, sio.Out(sio.Text), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
@@ -114,7 +114,7 @@ func TestDoFileDoMultipartDoURL(t *testing.T) {
 	}
 
 	fh := newMultipartHeader(t, "multi")
-	out, err = DoMultipart(ctx, fh, ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err = DoMultipart(ctx, fh, sio.Out(sio.Text), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
@@ -142,7 +142,7 @@ func TestDoFileDoMultipartDoURL(t *testing.T) {
 		_ = sio.Configure(sio.NewConfig(&http.Client{Timeout: 30 * time.Second}))
 	})
 
-	out, err = DoURL(ctx, "http://example.com", ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err = DoURL(ctx, "http://example.com", sio.Out(sio.Text), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
@@ -158,7 +158,7 @@ func TestDoFileDoMultipartDoURL(t *testing.T) {
 func TestStreamOutput(t *testing.T) {
 	ctx := newSessionCtx(t)
 
-	out, err := DoBytes(ctx, []byte("stream"), ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err := DoBytes(ctx, []byte("stream"), sio.Out(sio.Text), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
@@ -176,7 +176,7 @@ func TestStreamOutput(t *testing.T) {
 }
 
 func TestDoNoSession(t *testing.T) {
-	if _, err := Do(context.Background(), bytes.NewBufferString("x"), ".txt", func(ctx context.Context, r io.Reader, w io.Writer) error {
+	if _, err := Do(context.Background(), bytes.NewBufferString("x"), sio.Out(sio.Text), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	}); err == nil {

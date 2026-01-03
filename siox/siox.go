@@ -14,45 +14,45 @@ type DoFn = func(ctx context.Context, r io.Reader, w io.Writer) error
 // Do: io.Reader → Output
 // -----------------------------------------------------------------------------
 
-func Do(ctx context.Context, r io.Reader, ext string, fn DoFn) (*sio.Output, error) {
+func Do(ctx context.Context, r io.Reader, out sio.OutConfig, fn DoFn) (*sio.Output, error) {
 	src := sio.NewGenericReader(r)
-	return sio.Process(ctx, src, sio.Out(ext), fn)
+	return sio.Process(ctx, src, out, fn)
 }
 
 // -----------------------------------------------------------------------------
 // Bytes
 // -----------------------------------------------------------------------------
 
-func DoBytes(ctx context.Context, data []byte, ext string, fn DoFn) (*sio.Output, error) {
+func DoBytes(ctx context.Context, data []byte, out sio.OutConfig, fn DoFn) (*sio.Output, error) {
 	src := sio.NewBytesReader(data)
-	return sio.Process(ctx, src, sio.Out(ext), fn)
+	return sio.Process(ctx, src, out, fn)
 }
 
 // -----------------------------------------------------------------------------
 // File path
 // -----------------------------------------------------------------------------
 
-func DoFile(ctx context.Context, path string, ext string, fn DoFn) (*sio.Output, error) {
+func DoFile(ctx context.Context, path string, out sio.OutConfig, fn DoFn) (*sio.Output, error) {
 	src := sio.NewFileReader(path)
-	return sio.Process(ctx, src, sio.Out(ext), fn)
+	return sio.Process(ctx, src, out, fn)
 }
 
 // -----------------------------------------------------------------------------
 // multipart.FileHeader
 // -----------------------------------------------------------------------------
 
-func DoMultipart(ctx context.Context, fh *multipart.FileHeader, ext string, fn DoFn) (*sio.Output, error) {
+func DoMultipart(ctx context.Context, fh *multipart.FileHeader, out sio.OutConfig, fn DoFn) (*sio.Output, error) {
 	src := sio.NewMultipartReader(fh)
-	return sio.Process(ctx, src, sio.Out(ext), fn)
+	return sio.Process(ctx, src, out, fn)
 }
 
 // -----------------------------------------------------------------------------
 // URL
 // -----------------------------------------------------------------------------
 
-func DoURL(ctx context.Context, urlStr string, ext string, fn DoFn) (*sio.Output, error) {
+func DoURL(ctx context.Context, urlStr string, out sio.OutConfig, fn DoFn) (*sio.Output, error) {
 	src := sio.NewURLReader(urlStr)
-	return sio.Process(ctx, src, sio.Out(ext), fn)
+	return sio.Process(ctx, src, out, fn)
 }
 
 // -----------------------------------------------------------------------------

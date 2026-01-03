@@ -30,6 +30,7 @@ const (
 	Docx  = ".docx"
 	Pptx  = ".pptx"
 	Zip   = ".zip"
+	Json  = ".json"
 )
 
 func ToExt(format string) string {
