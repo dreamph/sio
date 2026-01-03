@@ -173,6 +173,15 @@ type FileReader struct {
 func NewFileReader(path string) *FileReader { return &FileReader{Path: path} }
 
 func (f *FileReader) Open() (io.ReadCloser, error) { return os.Open(f.Path) }
+
+func (f *FileReader) Size() int64 {
+	fi, err := os.Stat(f.Path)
+	if err != nil {
+		return -1
+	}
+	return fi.Size()
+}
+
 func (f *FileReader) Cleanup() error {
 	return nil
 }
@@ -213,11 +222,7 @@ func (m *GenericReader) Open() (io.ReadCloser, error) {
 		return nil, fmt.Errorf("sio: GenericReader: underlying reader is nil")
 	}
 
-	if rc, ok := m.File.(io.ReadCloser); ok {
-		return rc, nil
-	}
-
-	return io.NopCloser(m.File), nil
+	return NopCloser(m.File), nil
 }
 
 func (m *GenericReader) Cleanup() error { return nil }
@@ -237,7 +242,11 @@ func NewBytesReader(data []byte) *BytesReader {
 }
 
 func (b *BytesReader) Open() (io.ReadCloser, error) {
-	return io.NopCloser(bytes.NewReader(b.Data)), nil
+	return NopCloser(bytes.NewReader(b.Data)), nil
+}
+
+func (b *BytesReader) Size() int64 {
+	return int64(len(b.Data))
 }
 
 func (b *BytesReader) Cleanup() error {
@@ -318,7 +327,7 @@ func (u *URLReader) Open() (io.ReadCloser, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, ErrDownloadFailed
 	}
 
@@ -524,7 +533,7 @@ func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*
 	if err != nil {
 		return nil, err
 	}
-	f.Close()
+	_ = f.Close()
 
 	out := &Output{
 		path:        f.Name(),
@@ -775,6 +784,47 @@ func (b *bytesWriteCloser) Close() error {
 	return nil
 }
 
+// readerAtReader is any type that implements both io.Reader and io.ReaderAt.
+type readerAtReader struct {
+	io.Reader
+	io.ReaderAt
+}
+
+// readerAtReadCloser preserves ReaderAt while adding a no-op Close().
+type readerAtReadCloser struct {
+	*readerAtReader
+}
+
+func (r readerAtReadCloser) Close() error { return nil }
+
+func NopCloser(r io.Reader) io.ReadCloser {
+	if r == nil {
+		return nil
+	}
+
+	// Already a ReadCloser - return as-is
+	if rc, ok := r.(io.ReadCloser); ok {
+		return rc
+	}
+
+	if rc, ok := r.(readerAtReadCloser); ok {
+		return rc
+	}
+
+	// Preserve ReaderAt capability if present
+	if ra, ok := r.(io.ReaderAt); ok {
+		return readerAtReadCloser{
+			&readerAtReader{
+				Reader:   r,
+				ReaderAt: ra,
+			},
+		}
+	}
+
+	// Simple case - just wrap with no-op closer
+	return io.NopCloser(r)
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                  Output                                     */
 /* -------------------------------------------------------------------------- */
@@ -816,9 +866,9 @@ func (o *Output) OpenReader() (io.ReadCloser, error) {
 	// For StorageMemory mode, return reader from memory
 	if o.storageType == StorageMemory {
 		if o.data == nil {
-			return io.NopCloser(bytes.NewReader([]byte{})), nil
+			return NopCloser(bytes.NewReader([]byte{})), nil
 		}
-		return io.NopCloser(bytes.NewReader(o.data)), nil
+		return NopCloser(bytes.NewReader(o.data)), nil
 	}
 
 	// For StorageFile mode, return file reader
@@ -1159,13 +1209,13 @@ func OpenReaderList(sources []StreamReader) (*ReaderList, error) {
 
 	for _, source := range sources {
 		if source == nil {
-			rl.Close()
+			_ = rl.Close()
 			return nil, ErrNilSource
 		}
 
 		rc, err := source.Open()
 		if err != nil {
-			rl.Close()
+			_ = rl.Close()
 			return nil, fmt.Errorf("%w: %v", ErrOpenFailed, err)
 		}
 
@@ -1459,14 +1509,59 @@ func Size(ctx context.Context, source StreamReader) (int64, error) {
 	return *fileSize, nil
 }
 
+func SizeFromStream(sr StreamReader) int64 {
+	if s, ok := sr.(sizer); ok {
+		return s.Size()
+	}
+	return -1
+}
+
 func SizeFromReader(r io.Reader) int64 {
 	switch v := r.(type) {
+	case readerAtReadCloser:
+		if v.readerAtReader != nil && v.readerAtReader.Reader != nil {
+			return SizeFromReader(v.readerAtReader.Reader)
+		}
+	case *readerAtReadCloser:
+		if v != nil && v.readerAtReader != nil && v.readerAtReader.Reader != nil {
+			return SizeFromReader(v.readerAtReader.Reader)
+		}
+
 	case *os.File:
 		if fi, err := v.Stat(); err == nil {
 			return fi.Size()
 		}
+
+	case *bytes.Reader:
+		return v.Size()
+
+	case *strings.Reader:
+		return int64(v.Size())
+
+	case *bytes.Buffer:
+		return int64(v.Len())
+
+	case interface{ Size() int64 }:
+		if n := v.Size(); n >= 0 {
+			return n
+		}
+
 	case interface{ Len() int }:
 		return int64(v.Len())
+
+	case io.ReadSeeker:
+		cur, err := v.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return -1
+		}
+		end, err := v.Seek(0, io.SeekEnd)
+		if err != nil {
+			return -1
+		}
+		if _, err := v.Seek(cur, io.SeekStart); err != nil {
+			return -1
+		}
+		return end
 	}
 	return -1
 }
@@ -1509,8 +1604,8 @@ type ReaderAtResult struct {
 }
 
 type ToReaderAtOptions struct {
-	MaxMemoryBytes int64  // if <= 0, always spool to temp file
-	TempDir        string // optional; session dir will be used if available
+	MaxMemoryBytes int64  // if <= 0 → always spool to temp file
+	TempDir        string // optional; if empty session dir will be used
 	TempPattern    string
 }
 
@@ -1529,18 +1624,57 @@ func WithTempPattern(p string) ToReaderAtOption {
 }
 
 type fileStatter interface{ Stat() (os.FileInfo, error) }
-
 type sizer interface{ Size() int64 }
 
+func unwrapReaderAt(r io.ReaderAt) io.ReaderAt {
+	// unwrap our wrapper to the real ReaderAt (e.g. *bytes.Reader, *os.File)
+	switch v := r.(type) {
+	case readerAtReadCloser:
+		if v.readerAtReader != nil && v.readerAtReader.ReaderAt != nil {
+			return v.readerAtReader.ReaderAt
+		}
+	case *readerAtReadCloser:
+		if v != nil && v.readerAtReader != nil && v.readerAtReader.ReaderAt != nil {
+			return v.readerAtReader.ReaderAt
+		}
+	}
+	return r
+}
+
+// ToReaderAt converts any io.Reader into something that supports io.ReaderAt.
+// - If the input already supports ReaderAt → returns it directly.
+// - If it is small enough → keeps it in memory.
+// - If too large → spills to temporary file.
 func ToReaderAt(ctx context.Context, r io.Reader, opts ...ToReaderAtOption) (*ReaderAtResult, error) {
 	if r == nil {
 		return nil, errors.New("sio: ToReaderAt: nil reader")
 	}
 
-	// Default options
+	// unwrap UseReader (binder wrapper)
+	if ur, ok := r.(*UseReader); ok {
+		if err := ur.Err(); err != nil {
+			return nil, err
+		}
+		if inner := ur.Unwrap(); inner != nil {
+			r = inner
+		}
+	}
+
+	// unwrap downloadReaderCloser wrapper
+	if drc, ok := r.(*downloadReaderCloser); ok && drc.reader != nil {
+		r = drc.reader
+	}
+
+	if drc, ok := r.(readerAtReadCloser); ok && drc.readerAtReader != nil {
+		if inner := drc.readerAtReader.Reader; inner != nil {
+			r = inner
+		}
+	}
+
+	// --- Apply options ---
 	o := ToReaderAtOptions{
-		MaxMemoryBytes: 8 << 20,          // 8MB default
-		TempPattern:    "sio-readerat-*", // default temp pattern
+		MaxMemoryBytes: 8 << 20,          // default 8MB
+		TempPattern:    "sio-readerat-*", // default temp file pattern
 	}
 	for _, fn := range opts {
 		if fn != nil {
@@ -1548,7 +1682,7 @@ func ToReaderAt(ctx context.Context, r io.Reader, opts ...ToReaderAtOption) (*Re
 		}
 	}
 
-	// If TempDir not provided → try to use session Dir()
+	// If TempDir not provided, try use IoSession dir
 	if strings.TrimSpace(o.TempDir) == "" {
 		if ses := Session(ctx); ses != nil {
 			if d, ok := ses.(interface{ Dir() string }); ok {
@@ -1559,55 +1693,48 @@ func ToReaderAt(ctx context.Context, r io.Reader, opts ...ToReaderAtOption) (*Re
 		}
 	}
 
-	// ---------- Fast path: Reader already supports ReaderAt ----------
-	if ra, ok := r.(io.ReaderAt); ok {
+	// --- Fast path: if already ReaderAt, use directly ---
+	if ra0, ok := r.(io.ReaderAt); ok {
+		ra := unwrapReaderAt(ra0)
 
-		// Has Stat() → reliable size
-		if st, ok := r.(fileStatter); ok {
-			fi, err := st.Stat()
-			if err != nil {
-				return nil, err
+		var size int64 = -1
+
+		if st, ok := ra.(fileStatter); ok {
+			if fi, err := st.Stat(); err == nil {
+				size = fi.Size()
 			}
-			return &ReaderAtResult{
-				ReaderAt: ra,
-				Size:     fi.Size(),
-				Cleanup:  func() error { return nil },
-				Source:   "direct",
-			}, nil
+		}
+		if size < 0 {
+			if sz, ok := ra.(sizer); ok {
+				size = sz.Size()
+			}
+		}
+		if size < 0 {
+			// last resort
+			if sz := SizeFromReader(r); sz > 0 {
+				size = sz
+			}
 		}
 
-		// Has Size() → also reliable
-		if sz, ok := r.(sizer); ok {
-			return &ReaderAtResult{
-				ReaderAt: ra,
-				Size:     sz.Size(),
-				Cleanup:  func() error { return nil },
-				Source:   "direct",
-			}, nil
-		}
-
-		// Unknown size but still usable
 		return &ReaderAtResult{
 			ReaderAt: ra,
-			Size:     -1,
+			Size:     size,
 			Cleanup:  func() error { return nil },
 			Source:   "direct",
 		}, nil
 	}
 
-	// ---------- Force spooling to temp file ----------
+	// --- Force spool to temp file ---
 	if o.MaxMemoryBytes <= 0 {
 		return spoolToTempFile(r, o.TempDir, o.TempPattern)
 	}
 
-	// ---------- Try in-memory first, then spill to disk ----------
+	// --- Try in-memory first, then spill if exceeds limit ---
 	limit := o.MaxMemoryBytes
-
-	// Pre-allocate reasonable buffer
-	buf := make([]byte, 0, minInt64(limit, 64<<10)) // up to 64KB initial cap
+	buf := make([]byte, 0, minInt64(limit, 64<<10)) // up to 64KB prealloc
 	tmp := make([]byte, 32<<10)
-	var total int64
 
+	var total int64
 	for total <= limit {
 		n, err := r.Read(tmp)
 		if n > 0 {
@@ -1616,7 +1743,7 @@ func ToReaderAt(ctx context.Context, r io.Reader, opts ...ToReaderAtOption) (*Re
 		}
 
 		if err != nil {
-			// Entire stream fits in memory
+			// Fits fully in memory
 			if err == io.EOF {
 				return &ReaderAtResult{
 					ReaderAt: bytes.NewReader(buf),
@@ -1633,12 +1760,11 @@ func ToReaderAt(ctx context.Context, r io.Reader, opts ...ToReaderAtOption) (*Re
 		}
 	}
 
-	// Too large → spill prefix + remaining stream to temp file
+	// Exceeded allowed memory → spill to disk
 	return spillWithPrefix(r, buf, o.TempDir, o.TempPattern)
 }
 
-// spoolToTempFile writes the entire reader into a temp file
-// and returns a ReaderAt over that file.
+// Writes the entire reader to a temp file and returns ReaderAt
 func spoolToTempFile(r io.Reader, dir, pattern string) (*ReaderAtResult, error) {
 	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
@@ -1669,8 +1795,7 @@ func spoolToTempFile(r io.Reader, dir, pattern string) (*ReaderAtResult, error) 
 	}, nil
 }
 
-// spillWithPrefix writes buffered prefix + remaining stream
-// into a temp file and returns a ReaderAt.
+// Writes buffered prefix plus remaining reader to a temp file
 func spillWithPrefix(r io.Reader, prefix []byte, dir, pattern string) (*ReaderAtResult, error) {
 	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
@@ -1679,7 +1804,7 @@ func spillWithPrefix(r io.Reader, prefix []byte, dir, pattern string) (*ReaderAt
 
 	var total int64
 
-	// Write prefix
+	// Write prefix first
 	if len(prefix) > 0 {
 		n, err := tmp.Write(prefix)
 		if err != nil {
@@ -1690,7 +1815,7 @@ func spillWithPrefix(r io.Reader, prefix []byte, dir, pattern string) (*ReaderAt
 		total += int64(n)
 	}
 
-	// Write remaining stream
+	// Write the rest
 	n2, err := Copy(tmp, r)
 	if err != nil {
 		_ = tmp.Close()

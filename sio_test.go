@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStorageTypeString(t *testing.T) {
@@ -989,5 +992,716 @@ func BenchmarkStorageFileProcess(b *testing.B) {
 		_, _ = out.Bytes()
 
 		ses.Cleanup()
+	}
+}
+
+type stubStreamReader struct {
+	openFn    func() (io.ReadCloser, error)
+	cleanupFn func() error
+}
+
+func (s stubStreamReader) Open() (io.ReadCloser, error) {
+	if s.openFn == nil {
+		return nil, errors.New("open not implemented")
+	}
+	return s.openFn()
+}
+
+func (s stubStreamReader) Cleanup() error {
+	if s.cleanupFn != nil {
+		return s.cleanupFn()
+	}
+	return nil
+}
+
+type errReadCloser struct{}
+
+func (e *errReadCloser) Read(p []byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (e *errReadCloser) Close() error {
+	return errors.New("close failed")
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (r roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return r(req)
+}
+
+type seekOnlyReader struct {
+	data []byte
+	pos  int64
+}
+
+func (s *seekOnlyReader) Read(p []byte) (int, error) {
+	if s.pos >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.data[s.pos:])
+	s.pos += int64(n)
+	return n, nil
+}
+
+func (s *seekOnlyReader) Seek(offset int64, whence int) (int64, error) {
+	var next int64
+	switch whence {
+	case io.SeekStart:
+		next = offset
+	case io.SeekCurrent:
+		next = s.pos + offset
+	case io.SeekEnd:
+		next = int64(len(s.data)) + offset
+	default:
+		return 0, errors.New("invalid whence")
+	}
+	if next < 0 {
+		return 0, errors.New("negative position")
+	}
+	s.pos = next
+	return s.pos, nil
+}
+
+type dummySession struct{}
+
+func (d dummySession) Read(ctx context.Context, source StreamReader, fn ReadFunc) error {
+	return nil
+}
+func (d dummySession) ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) error {
+	return nil
+}
+func (d dummySession) Process(ctx context.Context, source StreamReader, out OutConfig, fn ProcessFunc) (*Output, error) {
+	return nil, nil
+}
+func (d dummySession) ProcessList(ctx context.Context, sources []StreamReader, out OutConfig, fn ProcessListFunc) (*Output, error) {
+	return nil, nil
+}
+func (d dummySession) Cleanup() error { return nil }
+
+func TestToExt(t *testing.T) {
+	if got := ToExt("pdf"); got != ".pdf" {
+		t.Fatalf("ToExt = %q, want %q", got, ".pdf")
+	}
+}
+
+func TestConfigure(t *testing.T) {
+	old := httpClient
+	t.Cleanup(func() { httpClient = old })
+
+	custom := &http.Client{Timeout: 12 * time.Second}
+	if err := Configure(Config{Client: custom}); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if httpClient != custom {
+		t.Fatalf("httpClient not updated")
+	}
+
+	if err := Configure(Config{}); err != nil {
+		t.Fatalf("Configure (nil): %v", err)
+	}
+	if httpClient != custom {
+		t.Fatalf("httpClient should remain unchanged")
+	}
+}
+
+func TestFileReaderSizeAndOpenError(t *testing.T) {
+	fr := NewFileReader(filepath.Join(t.TempDir(), "missing.txt"))
+	if fr.Size() != -1 {
+		t.Fatalf("Size should be -1 for missing file")
+	}
+	if _, err := fr.Open(); err == nil {
+		t.Fatalf("Open should fail for missing file")
+	}
+}
+
+func TestMultipartReaderAndPartReader(t *testing.T) {
+	buf := &bytes.Buffer{}
+	w := multipart.NewWriter(buf)
+	fw, err := w.CreateFormFile("file", "test.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := fw.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close writer: %v", err)
+	}
+	body := append([]byte(nil), buf.Bytes()...)
+
+	req, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	if err := req.ParseMultipartForm(1024); err != nil {
+		t.Fatalf("ParseMultipartForm: %v", err)
+	}
+
+	fh := req.MultipartForm.File["file"][0]
+	mr := NewMultipartReader(fh)
+	rc, err := mr.Open()
+	if err != nil {
+		t.Fatalf("MultipartReader.Open: %v", err)
+	}
+	data, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(data) != "hello" {
+		t.Fatalf("MultipartReader read %q", string(data))
+	}
+
+	partReader := multipart.NewReader(bytes.NewReader(body), w.Boundary())
+	part, err := partReader.NextPart()
+	if err != nil {
+		t.Fatalf("NextPart: %v", err)
+	}
+	generic := NewPartReader(part)
+	prc, err := generic.Open()
+	if err != nil {
+		t.Fatalf("PartReader.Open: %v", err)
+	}
+	data, _ = io.ReadAll(prc)
+	prc.Close()
+	if string(data) != "hello" {
+		t.Fatalf("PartReader read %q", string(data))
+	}
+}
+
+func TestURLReader(t *testing.T) {
+	t.Run("invalid url", func(t *testing.T) {
+		r := NewURLReader("://bad")
+		_, err := r.Open()
+		if !errors.Is(err, ErrInvalidURL) {
+			t.Fatalf("expected ErrInvalidURL, got %v", err)
+		}
+	})
+
+	t.Run("invalid scheme", func(t *testing.T) {
+		r := NewURLReader("ftp://example.com")
+		_, err := r.Open()
+		if !errors.Is(err, ErrInvalidURL) {
+			t.Fatalf("expected ErrInvalidURL, got %v", err)
+		}
+	})
+
+	t.Run("non-2xx", func(t *testing.T) {
+		client := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("fail")),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		}
+		r := NewURLReader("http://example.com", URLReaderOptions{Client: client})
+		_, err := r.Open()
+		if !errors.Is(err, ErrDownloadFailed) {
+			t.Fatalf("expected ErrDownloadFailed, got %v", err)
+		}
+	})
+
+	t.Run("ok", func(t *testing.T) {
+		client := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Header:     make(http.Header),
+				}, nil
+			}),
+		}
+		r := NewURLReader("http://example.com", URLReaderOptions{Client: client})
+		rc, err := r.Open()
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		data, _ := io.ReadAll(rc)
+		rc.Close()
+		if string(data) != "ok" {
+			t.Fatalf("got %q", string(data))
+		}
+	})
+
+	t.Run("client error", func(t *testing.T) {
+		client := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, errors.New("boom")
+			}),
+		}
+		r := NewURLReader("http://example.com", URLReaderOptions{Client: client})
+		_, err := r.Open()
+		if !errors.Is(err, ErrDownloadFailed) {
+			t.Fatalf("expected ErrDownloadFailed, got %v", err)
+		}
+	})
+
+	t.Run("custom client used", func(t *testing.T) {
+		custom := &http.Client{Timeout: 2 * time.Second}
+		r := NewURLReader("http://example.com", URLReaderOptions{Client: custom})
+		if r.client != custom {
+			t.Fatalf("expected custom client to be used")
+		}
+	})
+
+	t.Run("insecure tls option sets transport", func(t *testing.T) {
+		r := NewURLReader("https://example.com", URLReaderOptions{InsecureTLS: true})
+		tr, ok := r.client.Transport.(*http.Transport)
+		if !ok || tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+			t.Fatalf("expected InsecureTLS transport")
+		}
+	})
+}
+
+func TestManagerBaseDirAndSessionDir(t *testing.T) {
+	mgr, err := NewIoManager("", StorageMemory)
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer mgr.Cleanup()
+
+	if mgr.(*manager).BaseDir() != "" {
+		t.Fatalf("BaseDir should be empty for memory storage")
+	}
+
+	fileMgr, err := NewIoManager("", StorageFile)
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer fileMgr.Cleanup()
+
+	base := fileMgr.(*manager).BaseDir()
+	if base == "" {
+		t.Fatalf("BaseDir should be set for file storage")
+	}
+
+	ses, err := fileMgr.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer ses.Cleanup()
+
+	if ses.(*ioSession).Dir() == "" {
+		t.Fatalf("Dir should be set for file storage")
+	}
+}
+
+func TestNopCloser(t *testing.T) {
+	if NopCloser(nil) != nil {
+		t.Fatalf("NopCloser(nil) should return nil")
+	}
+
+	rc := io.NopCloser(strings.NewReader("x"))
+	if got := NopCloser(rc); got != rc {
+		t.Fatalf("NopCloser should return original ReadCloser")
+	}
+
+	br := bytes.NewReader([]byte("readerat"))
+	nc := NopCloser(br)
+	if _, ok := nc.(io.ReaderAt); !ok {
+		t.Fatalf("NopCloser should preserve ReaderAt")
+	}
+}
+
+func TestOutputOpenReaderWriterErrors(t *testing.T) {
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	iSes := ses.(*ioSession)
+
+	out, err := iSes.newOutputWithStorage(".txt", StorageMemory)
+	if err != nil {
+		t.Fatalf("newOutputWithStorage: %v", err)
+	}
+	_ = out.cleanup()
+
+	if _, err := out.OpenReader(); err == nil {
+		t.Fatalf("OpenReader should fail after cleanup")
+	}
+	if _, err := out.OpenWriter(); err == nil {
+		t.Fatalf("OpenWriter should fail after cleanup")
+	}
+}
+
+func TestOutputDataFileStorageNil(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr, _ := NewIoManager(tmpDir, StorageFile)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	out, err := Process(ctx, NewBytesReader([]byte("data")), Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Data() != nil {
+		t.Fatalf("Data should be nil for file storage")
+	}
+}
+
+func TestDeleteAfterUse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "delete.txt")
+	if err := os.WriteFile(path, []byte("remove"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	src := In(NewFileReader(path), DeleteAfterUse())
+	if err := Read(context.Background(), src, func(ctx context.Context, r io.Reader) error {
+		_, err := io.ReadAll(r)
+		return err
+	}); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected file to be deleted")
+	}
+}
+
+func TestNewDownloadReaderCloser(t *testing.T) {
+	if _, err := NewDownloadReaderCloser(nil); err == nil {
+		t.Fatalf("expected error for nil streamReader")
+	}
+
+	cleanupCalled := false
+	src := stubStreamReader{
+		openFn: func() (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("data")), nil
+		},
+		cleanupFn: func() error {
+			cleanupCalled = true
+			return nil
+		},
+	}
+
+	drc, err := NewDownloadReaderCloser(src, func() { cleanupCalled = true })
+	if err != nil {
+		t.Fatalf("NewDownloadReaderCloser: %v", err)
+	}
+
+	buf := make([]byte, 4)
+	if _, err := drc.Read(buf); err != nil && err != io.EOF {
+		t.Fatalf("Read: %v", err)
+	}
+
+	if err := drc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !cleanupCalled {
+		t.Fatalf("cleanup not called")
+	}
+	if _, err := drc.Read(buf); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("expected ErrClosedPipe after close, got %v", err)
+	}
+}
+
+func TestReaderListCloseAndOpenReaderListErrors(t *testing.T) {
+	rl, err := OpenReaderList(nil)
+	if err != nil {
+		t.Fatalf("OpenReaderList empty: %v", err)
+	}
+	if len(rl.Readers) != 0 {
+		t.Fatalf("expected empty ReaderList")
+	}
+
+	if _, err := OpenReaderList([]StreamReader{nil}); !errors.Is(err, ErrNilSource) {
+		t.Fatalf("expected ErrNilSource, got %v", err)
+	}
+
+	_, err = OpenReaderList([]StreamReader{
+		stubStreamReader{openFn: func() (io.ReadCloser, error) {
+			return nil, errors.New("open failed")
+		}},
+	})
+	if !errors.Is(err, ErrOpenFailed) {
+		t.Fatalf("expected ErrOpenFailed, got %v", err)
+	}
+
+	rl, err = OpenReaderList([]StreamReader{
+		stubStreamReader{
+			openFn: func() (io.ReadCloser, error) {
+				return &errReadCloser{}, nil
+			},
+			cleanupFn: func() error { return errors.New("cleanup failed") },
+		},
+	})
+	if err != nil {
+		t.Fatalf("OpenReaderList: %v", err)
+	}
+	if err := rl.Close(); err == nil {
+		t.Fatalf("expected error from ReaderList.Close")
+	}
+}
+
+func TestReadListAndProcessListErrors(t *testing.T) {
+	if err := ReadList(context.Background(), nil, func(ctx context.Context, readers []io.Reader) error { return nil }); !errors.Is(err, ErrNilSource) {
+		t.Fatalf("expected ErrNilSource, got %v", err)
+	}
+	if err := ReadList(context.Background(), []StreamReader{NewBytesReader([]byte("x"))}, nil); err == nil {
+		t.Fatalf("expected error for nil ReadList func")
+	}
+
+	mgr, _ := NewIoManager("", StorageMemory)
+	defer mgr.Cleanup()
+	ses, _ := mgr.NewSession()
+	defer ses.Cleanup()
+	ctx := WithSession(context.Background(), ses)
+
+	if _, err := ProcessList(ctx, nil, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) error { return nil }); err == nil {
+		t.Fatalf("expected error for empty sources")
+	}
+	if _, err := ProcessList(ctx, []StreamReader{NewBytesReader([]byte("x"))}, Out(".txt"), nil); err == nil {
+		t.Fatalf("expected error for nil ProcessList func")
+	}
+}
+
+func TestReadLinesAndReadFileLines(t *testing.T) {
+	if err := ReadLines(context.Background(), NewBytesReader([]byte("a\nb")), nil); err != nil {
+		t.Fatalf("ReadLines nil fn: %v", err)
+	}
+
+	stopErr := errors.New("stop")
+	err := ReadLines(context.Background(), NewBytesReader([]byte("a\nb")), func(line string) error {
+		return stopErr
+	})
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("expected stop error, got %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "lines.txt")
+	if err := os.WriteFile(path, []byte("l1\nl2"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	var lines []string
+	if err := ReadFileLines(context.Background(), path, func(line string) error {
+		lines = append(lines, line)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadFileLines: %v", err)
+	}
+	if len(lines) != 2 || lines[0] != "l1" || lines[1] != "l2" {
+		t.Fatalf("unexpected lines: %v", lines)
+	}
+}
+
+func TestSizeAndSizeHelpers(t *testing.T) {
+	if _, err := Size(context.Background(), nil); !errors.Is(err, ErrNilSource) {
+		t.Fatalf("expected ErrNilSource, got %v", err)
+	}
+
+	size, err := Size(context.Background(), NewBytesReader([]byte("abc")))
+	if err != nil {
+		t.Fatalf("Size: %v", err)
+	}
+	if size != 3 {
+		t.Fatalf("Size = %d", size)
+	}
+
+	if got := SizeFromStream(NewBytesReader([]byte("x"))); got != 1 {
+		t.Fatalf("SizeFromStream = %d", got)
+	}
+	if got := SizeFromStream(NewGenericReader(strings.NewReader("x"))); got != -1 {
+		t.Fatalf("SizeFromStream for non-sizer = %d", got)
+	}
+
+	if got := SizeFromReader(bytes.NewBufferString("buf")); got != 3 {
+		t.Fatalf("SizeFromReader buffer = %d", got)
+	}
+	if got := SizeFromReader(strings.NewReader("str")); got != 3 {
+		t.Fatalf("SizeFromReader strings.Reader = %d", got)
+	}
+	seek := &seekOnlyReader{data: []byte("seek")}
+	if got := SizeFromReader(seek); got != 4 {
+		t.Fatalf("SizeFromReader seek = %d", got)
+	}
+
+	if _, err := SizeFromPath(filepath.Join(t.TempDir(), "missing.txt")); err == nil {
+		t.Fatalf("expected error for missing path")
+	}
+}
+
+func TestWriteFileAndWriteStreamToFileErrors(t *testing.T) {
+	if _, err := WriteFile(nil, "x"); !errors.Is(err, ErrNilSource) {
+		t.Fatalf("expected ErrNilSource, got %v", err)
+	}
+
+	if _, err := WriteStreamToFile(nil, "x"); !errors.Is(err, ErrNilSource) {
+		t.Fatalf("expected ErrNilSource, got %v", err)
+	}
+
+	_, err := WriteStreamToFile(stubStreamReader{
+		openFn: func() (io.ReadCloser, error) {
+			return nil, errors.New("open failed")
+		},
+	}, filepath.Join(t.TempDir(), "out.txt"))
+	if err == nil {
+		t.Fatalf("expected error for open failure")
+	}
+}
+
+func TestCopyToFileError(t *testing.T) {
+	dir := t.TempDir()
+	guard := filepath.Join(dir, "file")
+	if err := os.WriteFile(guard, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	dst := filepath.Join(guard, "child.txt")
+	if _, err := copyToFile(strings.NewReader("data"), dst); err == nil {
+		t.Fatalf("expected error when parent is file")
+	}
+}
+
+func TestToReaderAtVariants(t *testing.T) {
+	ctx := context.Background()
+
+	if _, err := ToReaderAt(ctx, nil); err == nil {
+		t.Fatalf("expected error for nil reader")
+	}
+
+	direct, err := ToReaderAt(ctx, bytes.NewReader([]byte("abc")))
+	if err != nil {
+		t.Fatalf("ToReaderAt direct: %v", err)
+	}
+	if direct.Source != "direct" || direct.Size != 3 {
+		t.Fatalf("unexpected direct result: %#v", direct)
+	}
+	_ = direct.Cleanup()
+
+	mem, err := ToReaderAt(ctx, io.LimitReader(strings.NewReader("hello"), 5), WithMaxMemoryBytes(10))
+	if err != nil {
+		t.Fatalf("ToReaderAt memory: %v", err)
+	}
+	if mem.Source != "memory" || mem.Size != 5 {
+		t.Fatalf("unexpected memory result: %#v", mem)
+	}
+
+	tmpDir := t.TempDir()
+	temp, err := ToReaderAt(ctx, io.NopCloser(strings.NewReader("file")), WithMaxMemoryBytes(0), WithTempDir(tmpDir), WithTempPattern("sio-*"))
+	if err != nil {
+		t.Fatalf("ToReaderAt temp: %v", err)
+	}
+	if temp.Source != "tempFile" || temp.Size != 4 {
+		t.Fatalf("unexpected temp result: %#v", temp)
+	}
+	if f, ok := temp.ReaderAt.(*os.File); ok {
+		name := f.Name()
+		if err := temp.Cleanup(); err != nil {
+			t.Fatalf("Cleanup: %v", err)
+		}
+		if _, err := os.Stat(name); !os.IsNotExist(err) {
+			t.Fatalf("expected temp file removed")
+		}
+	}
+
+	spill, err := ToReaderAt(ctx, io.NopCloser(strings.NewReader("0123456789")), WithMaxMemoryBytes(4))
+	if err != nil {
+		t.Fatalf("ToReaderAt spill: %v", err)
+	}
+	if spill.Source != "tempFile" || spill.Size != 10 {
+		t.Fatalf("unexpected spill result: %#v", spill)
+	}
+	_ = spill.Cleanup()
+
+	if _, err := ToReaderAt(ctx, io.NopCloser(strings.NewReader("bad")), WithMaxMemoryBytes(0), WithTempDir(filepath.Join(t.TempDir(), "missing"))); err == nil {
+		t.Fatalf("expected error for invalid temp dir")
+	}
+}
+
+func TestMinInt64(t *testing.T) {
+	if got := minInt64(1, 2); got != 1 {
+		t.Fatalf("minInt64 = %d", got)
+	}
+}
+
+func TestUseReaderErrors(t *testing.T) {
+	var ur *UseReader
+	if _, err := ur.Read(make([]byte, 1)); err == nil {
+		t.Fatalf("expected error for nil UseReader")
+	}
+	if err := ur.Err(); err == nil {
+		t.Fatalf("expected error from Err on nil UseReader")
+	}
+
+	ur = &UseReader{err: errors.New("boom")}
+	if _, err := ur.Read(make([]byte, 1)); err == nil {
+		t.Fatalf("expected error for UseReader with err")
+	}
+	if err := ur.Err(); err == nil {
+		t.Fatalf("expected Err to return error")
+	}
+
+	ur = &UseReader{}
+	if _, err := ur.Read(make([]byte, 1)); err == nil {
+		t.Fatalf("expected error for nil reader")
+	}
+}
+
+func TestBinderAndBindErrors(t *testing.T) {
+	var b *Binder
+	ur := b.openReader(NewBytesReader([]byte("x")))
+	if ur.Err() == nil {
+		t.Fatalf("expected error for nil binder")
+	}
+
+	b = &Binder{}
+	if _, err := b.Use(nil); err == nil {
+		t.Fatalf("expected error for nil source")
+	}
+	if b.Err() == nil {
+		t.Fatalf("expected binder error after nil source")
+	}
+
+	if err := BindRead(context.Background(), nil); err == nil {
+		t.Fatalf("expected error for nil BindRead fn")
+	}
+	if _, err := BindReadResult[int](context.Background(), nil); err == nil {
+		t.Fatalf("expected error for nil BindReadResult fn")
+	}
+
+	if _, err := BindProcess(context.Background(), Out(".txt"), nil); err == nil {
+		t.Fatalf("expected error for nil BindProcess fn")
+	}
+	if _, err := BindProcess(context.Background(), Out(".txt"), func(ctx context.Context, b *Binder, w io.Writer) error { return nil }); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("expected ErrNoSession, got %v", err)
+	}
+
+	ctx := WithSession(context.Background(), dummySession{})
+	if _, err := BindProcess(ctx, Out(".txt"), func(ctx context.Context, b *Binder, w io.Writer) error { return nil }); !errors.Is(err, ErrInvalidSessionType) {
+		t.Fatalf("expected ErrInvalidSessionType, got %v", err)
+	}
+
+	if _, _, err := BindProcessResult[int](context.Background(), Out(".txt"), nil); err == nil {
+		t.Fatalf("expected error for nil BindProcessResult fn")
+	}
+	if _, _, err := BindProcessResult[int](context.Background(), Out(".txt"), func(ctx context.Context, b *Binder, w io.Writer) (*int, error) { return nil, nil }); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("expected ErrNoSession, got %v", err)
+	}
+	if _, _, err := BindProcessResult[int](ctx, Out(".txt"), func(ctx context.Context, b *Binder, w io.Writer) (*int, error) { return nil, nil }); !errors.Is(err, ErrInvalidSessionType) {
+		t.Fatalf("expected ErrInvalidSessionType, got %v", err)
+	}
+}
+
+func TestReadResultAndProcessResultErrors(t *testing.T) {
+	if _, err := ReadResult[int](context.Background(), NewBytesReader([]byte("x")), nil); err == nil {
+		t.Fatalf("expected error for nil ReadResult fn")
+	}
+	if _, err := ReadListResult[int](context.Background(), nil, func(ctx context.Context, readers []io.Reader) (*int, error) { return nil, nil }); err == nil {
+		t.Fatalf("expected error for empty ReadListResult sources")
+	}
+
+	if _, _, err := ProcessResult[int](context.Background(), NewBytesReader([]byte("x")), Out(".txt"), nil); err == nil {
+		t.Fatalf("expected error for nil ProcessResult fn")
+	}
+	if _, _, err := ProcessResult[int](context.Background(), NewBytesReader([]byte("x")), Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) (*int, error) { return nil, nil }); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("expected ErrNoSession, got %v", err)
+	}
+
+	if _, _, err := ProcessListResult[int](context.Background(), nil, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) (*int, error) { return nil, nil }); err == nil {
+		t.Fatalf("expected error for empty ProcessListResult sources")
 	}
 }

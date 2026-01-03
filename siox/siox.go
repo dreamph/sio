@@ -15,8 +15,8 @@ type DoFn = func(ctx context.Context, r io.Reader, w io.Writer) error
 // -----------------------------------------------------------------------------
 
 func Do(ctx context.Context, r io.Reader, ext string, fn DoFn) (*sio.Output, error) {
-	src := sio.NewIOReader(r)
-	return sio.Process(ctx, src, ext, fn)
+	src := sio.NewGenericReader(r)
+	return sio.Process(ctx, src, sio.Out(ext), fn)
 }
 
 // -----------------------------------------------------------------------------
@@ -25,7 +25,7 @@ func Do(ctx context.Context, r io.Reader, ext string, fn DoFn) (*sio.Output, err
 
 func DoBytes(ctx context.Context, data []byte, ext string, fn DoFn) (*sio.Output, error) {
 	src := sio.NewBytesReader(data)
-	return sio.Process(ctx, src, ext, fn)
+	return sio.Process(ctx, src, sio.Out(ext), fn)
 }
 
 // -----------------------------------------------------------------------------
@@ -34,7 +34,7 @@ func DoBytes(ctx context.Context, data []byte, ext string, fn DoFn) (*sio.Output
 
 func DoFile(ctx context.Context, path string, ext string, fn DoFn) (*sio.Output, error) {
 	src := sio.NewFileReader(path)
-	return sio.Process(ctx, src, ext, fn)
+	return sio.Process(ctx, src, sio.Out(ext), fn)
 }
 
 // -----------------------------------------------------------------------------
@@ -43,7 +43,7 @@ func DoFile(ctx context.Context, path string, ext string, fn DoFn) (*sio.Output,
 
 func DoMultipart(ctx context.Context, fh *multipart.FileHeader, ext string, fn DoFn) (*sio.Output, error) {
 	src := sio.NewMultipartReader(fh)
-	return sio.Process(ctx, src, ext, fn)
+	return sio.Process(ctx, src, sio.Out(ext), fn)
 }
 
 // -----------------------------------------------------------------------------
@@ -52,7 +52,7 @@ func DoMultipart(ctx context.Context, fh *multipart.FileHeader, ext string, fn D
 
 func DoURL(ctx context.Context, urlStr string, ext string, fn DoFn) (*sio.Output, error) {
 	src := sio.NewURLReader(urlStr)
-	return sio.Process(ctx, src, ext, fn)
+	return sio.Process(ctx, src, sio.Out(ext), fn)
 }
 
 // -----------------------------------------------------------------------------
