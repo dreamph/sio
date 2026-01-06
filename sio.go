@@ -787,9 +787,14 @@ func (s *ioSession) Process(
 		_ = output.cleanup()
 		return nil, err
 	}
-	defer w.Close()
 
 	if err := fn(ctx, r, w); err != nil {
+		_ = w.Close()
+		_ = output.cleanup()
+		return nil, err
+	}
+
+	if err := w.Close(); err != nil {
 		_ = output.cleanup()
 		return nil, err
 	}
@@ -832,9 +837,14 @@ func (s *ioSession) ProcessList(
 		_ = output.cleanup()
 		return nil, err
 	}
-	defer w.Close()
 
 	if err := fn(ctx, rl.readers, w); err != nil {
+		_ = w.Close()
+		_ = output.cleanup()
+		return nil, err
+	}
+
+	if err := w.Close(); err != nil {
 		_ = output.cleanup()
 		return nil, err
 	}
@@ -969,7 +979,9 @@ func (s *ioSession) Cleanup() error {
 		}
 	}
 
-	_ = os.Remove(s.dir)
+	if err := os.Remove(s.dir); err != nil && !os.IsNotExist(err) && firstErr == nil {
+		firstErr = err
+	}
 	return firstErr
 }
 
