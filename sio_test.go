@@ -21,8 +21,8 @@ func TestStorageTypeString(t *testing.T) {
 		st   StorageType
 		want string
 	}{
-		{StorageFile, "file"},
-		{StorageMemory, "memory"},
+		{File, "file"},
+		{Memory, "memory"},
 		{File, "file"},
 		{Memory, "memory"},
 	}
@@ -39,13 +39,13 @@ func TestStorageFunction(t *testing.T) {
 		input string
 		want  StorageType
 	}{
-		{"file", StorageFile},
-		{"FILE", StorageFile},
-		{"memory", StorageMemory},
-		{"MEMORY", StorageMemory},
-		{"  memory  ", StorageMemory},
-		{"unknown", StorageFile}, // default
-		{"", StorageFile},        // default
+		{"file", File},
+		{"FILE", File},
+		{"memory", Memory},
+		{"MEMORY", Memory},
+		{"  memory  ", Memory},
+		{"unknown", File}, // default
+		{"", File},        // default
 	}
 
 	for _, tt := range tests {
@@ -65,11 +65,11 @@ func TestOutOption(t *testing.T) {
 			t.Error("StorageType should be nil")
 		}
 		// Should use session default
-		if got := opt.getStorageType(StorageFile); got != StorageFile {
+		if got := opt.getStorageType(File); got != File {
 			t.Errorf("getStorageType(File) = %v, want File", got)
 		}
-		if got := opt.getStorageType(StorageMemory); got != StorageMemory {
-			t.Errorf("getStorageType(Bytes) = %v, want Bytes", got)
+		if got := opt.getStorageType(Memory); got != Memory {
+			t.Errorf("getStorageType(Memory) = %v, want Memory", got)
 		}
 	})
 
@@ -81,34 +81,120 @@ func TestOutOption(t *testing.T) {
 		if opt.StorageType() == nil {
 			t.Fatal("StorageType should not be nil")
 		}
-		if *opt.StorageType() != StorageMemory {
-			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType())
+		if *opt.StorageType() != Memory {
+			t.Errorf("StorageType = %v, want Memory", *opt.StorageType())
 		}
 		// Should override session default
-		if got := opt.getStorageType(StorageFile); got != StorageMemory {
-			t.Errorf("getStorageType should return Bytes, got %v", got)
+		if got := opt.getStorageType(File); got != Memory {
+			t.Errorf("getStorageType should return Memory, got %v", got)
 		}
 	})
 
 	t.Run("with file storage", func(t *testing.T) {
 		opt := Out(".txt", File)
-		if *opt.StorageType() != StorageFile {
+		if *opt.StorageType() != File {
 			t.Errorf("StorageType = %v, want File", *opt.StorageType())
 		}
 	})
 
 	t.Run("with Storage() string conversion", func(t *testing.T) {
 		opt := Out(".pdf", Storage("memory"))
-		if *opt.StorageType() != StorageMemory {
-			t.Errorf("StorageType = %v, want Bytes", *opt.StorageType())
+		if *opt.StorageType() != Memory {
+			t.Errorf("StorageType = %v, want Memory", *opt.StorageType())
 		}
 	})
 }
 
-func TestManagerWithStorageFile(t *testing.T) {
+func TestAutoThresholdManager(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	mgr, err := NewIoManager(tmpDir, StorageFile)
+	mgr, err := NewIoManager(tmpDir, Memory, WithThreshold(4))
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer mgr.Cleanup()
+
+	ses, err := mgr.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer ses.Cleanup()
+
+	ctx := WithSession(context.Background(), ses)
+
+	small := NewBytesReader([]byte("hey"))
+	out, err := Process(ctx, small, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process small: %v", err)
+	}
+	if out.StorageType() != Memory {
+		t.Fatalf("small StorageType = %v, want Memory", out.StorageType())
+	}
+
+	large := NewBytesReader([]byte("hello"))
+	out, err = Process(ctx, large, Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process large: %v", err)
+	}
+	if out.StorageType() != File {
+		t.Fatalf("large StorageType = %v, want File", out.StorageType())
+	}
+	if out.Path() == "" {
+		t.Fatal("large output Path should not be empty")
+	}
+}
+
+func TestAutoThresholdProcessOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mgr, err := NewIoManager(tmpDir, Memory, WithThreshold(10))
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+	defer mgr.Cleanup()
+
+	ses, err := mgr.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer ses.Cleanup()
+
+	ctx := WithSession(context.Background(), ses)
+
+	src := NewBytesReader([]byte("hello"))
+	out, err := Process(ctx, src, Out(".txt", WithThreshold(4)), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.StorageType() != File {
+		t.Fatalf("StorageType = %v, want File", out.StorageType())
+	}
+
+	out, err = Process(ctx, NewBytesReader([]byte("hi")), Out(".txt", File), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Process explicit: %v", err)
+	}
+	if out.StorageType() != File {
+		t.Fatalf("explicit StorageType = %v, want File", out.StorageType())
+	}
+}
+
+func TestManagerWithFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mgr, err := NewIoManager(tmpDir, File)
 	if err != nil {
 		t.Fatalf("NewIoManager: %v", err)
 	}
@@ -132,7 +218,7 @@ func TestManagerWithStorageFile(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 
-	if out.StorageType() != StorageFile {
+	if out.StorageType() != File {
 		t.Errorf("StorageType = %v, want File", out.StorageType())
 	}
 
@@ -155,8 +241,8 @@ func TestManagerWithStorageFile(t *testing.T) {
 	}
 }
 
-func TestManagerWithStorageBytes(t *testing.T) {
-	mgr, err := NewIoManager("", StorageMemory)
+func TestManagerWithStorageMemory(t *testing.T) {
+	mgr, err := NewIoManager("", Memory)
 	if err != nil {
 		t.Fatalf("NewIoManager: %v", err)
 	}
@@ -180,12 +266,12 @@ func TestManagerWithStorageBytes(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 
-	if out.StorageType() != StorageMemory {
-		t.Errorf("StorageType = %v, want Bytes", out.StorageType())
+	if out.StorageType() != Memory {
+		t.Errorf("StorageType = %v, want Memory", out.StorageType())
 	}
 
 	if out.Path() != "" {
-		t.Errorf("Path should be empty for bytes storage, got %q", out.Path())
+		t.Errorf("Path should be empty for memory storage, got %q", out.Path())
 	}
 
 	// Use Data() for zero-copy access
@@ -208,7 +294,7 @@ func TestMixedStorageInSession(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create manager with file storage (has directory)
-	mgr, err := NewIoManager(tmpDir, StorageFile)
+	mgr, err := NewIoManager(tmpDir, File)
 	if err != nil {
 		t.Fatalf("NewIoManager: %v", err)
 	}
@@ -231,8 +317,8 @@ func TestMixedStorageInSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process (mem): %v", err)
 	}
-	if out1.StorageType() != StorageMemory {
-		t.Errorf("out1 StorageType = %v, want Bytes", out1.StorageType())
+	if out1.StorageType() != Memory {
+		t.Errorf("out1 StorageType = %v, want Memory", out1.StorageType())
 	}
 
 	// Second output: use file (explicit)
@@ -244,7 +330,7 @@ func TestMixedStorageInSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process (file): %v", err)
 	}
-	if out2.StorageType() != StorageFile {
+	if out2.StorageType() != File {
 		t.Errorf("out2 StorageType = %v, want File", out2.StorageType())
 	}
 
@@ -257,7 +343,7 @@ func TestMixedStorageInSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process (default): %v", err)
 	}
-	if out3.StorageType() != StorageFile {
+	if out3.StorageType() != File {
 		t.Errorf("out3 StorageType = %v, want File", out3.StorageType())
 	}
 
@@ -277,9 +363,9 @@ func TestMixedStorageInSession(t *testing.T) {
 	}
 }
 
-func TestFileStorageUnavailableError(t *testing.T) {
-	// Create manager with bytes-only storage (no directory)
-	mgr, err := NewIoManager("", StorageMemory)
+func TestFileStorageWithMemoryManager(t *testing.T) {
+	// Create manager with Memory storage; it still has a directory.
+	mgr, err := NewIoManager("", Memory)
 	if err != nil {
 		t.Fatalf("NewIoManager: %v", err)
 	}
@@ -293,21 +379,28 @@ func TestFileStorageUnavailableError(t *testing.T) {
 
 	ctx := WithSession(context.Background(), ses)
 
-	// Try to force file storage - should fail
+	// Force file storage - should succeed.
 	src := NewBytesReader([]byte("test"))
-	_, err = Process(ctx, src, Out(".txt", File), func(ctx context.Context, r io.Reader, w io.Writer) error {
+	out, err := Process(ctx, src, Out(".txt", File), func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
 		return err
 	})
 
-	if !errors.Is(err, ErrFileStorageUnavailable) {
-		t.Errorf("expected ErrFileStorageUnavailable, got %v", err)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
 	}
+	if out.StorageType() != File {
+		t.Fatalf("StorageType = %v, want File", out.StorageType())
+	}
+	if out.Path() == "" {
+		t.Fatal("Path should be set for file output")
+	}
+
 }
 
 func TestOutputReader(t *testing.T) {
-	t.Run("bytes storage returns BytesReader", func(t *testing.T) {
-		mgr, _ := NewIoManager("", StorageMemory)
+	t.Run("memory storage returns BytesReader", func(t *testing.T) {
+		mgr, _ := NewIoManager("", Memory)
 		defer mgr.Cleanup()
 		ses, _ := mgr.NewSession()
 		defer ses.Cleanup()
@@ -330,7 +423,7 @@ func TestOutputReader(t *testing.T) {
 
 	t.Run("file storage returns FileReader", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		mgr, _ := NewIoManager(tmpDir, StorageFile)
+		mgr, _ := NewIoManager(tmpDir, File)
 		defer mgr.Cleanup()
 		ses, _ := mgr.NewSession()
 		defer ses.Cleanup()
@@ -353,7 +446,7 @@ func TestOutputReader(t *testing.T) {
 }
 
 func TestChainedProcessing(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -386,8 +479,8 @@ func TestChainedProcessing(t *testing.T) {
 }
 
 func TestKeepFlag(t *testing.T) {
-	t.Run("bytes storage respects keep", func(t *testing.T) {
-		mgr, _ := NewIoManager("", StorageMemory)
+	t.Run("memory storage does not keep", func(t *testing.T) {
+		mgr, _ := NewIoManager("", Memory)
 		defer mgr.Cleanup()
 		ses, _ := mgr.NewSession()
 		ctx := WithSession(context.Background(), ses)
@@ -401,16 +494,16 @@ func TestKeepFlag(t *testing.T) {
 		out.Keep()
 		ses.Cleanup()
 
-		// Data should still be accessible
+		// Data should be cleaned up for memory outputs
 		data := out.Data()
-		if string(data) != "keep me" {
-			t.Errorf("Data after cleanup = %q, want %q", string(data), "keep me")
+		if string(data) != "" {
+			t.Errorf("Data after cleanup = %q, want %q", string(data), "")
 		}
 	})
 
 	t.Run("file storage respects keep", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		mgr, _ := NewIoManager(tmpDir, StorageFile)
+		mgr, _ := NewIoManager(tmpDir, File)
 		defer mgr.Cleanup()
 		ses, _ := mgr.NewSession()
 		ctx := WithSession(context.Background(), ses)
@@ -433,7 +526,7 @@ func TestKeepFlag(t *testing.T) {
 }
 
 func TestSaveAs(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -460,7 +553,7 @@ func TestSaveAs(t *testing.T) {
 }
 
 func TestReadAndReadList(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -506,7 +599,7 @@ func TestReadAndReadList(t *testing.T) {
 }
 
 func TestProcessList(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -549,7 +642,7 @@ func TestNoSessionError(t *testing.T) {
 }
 
 func TestNilSourceError(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -584,7 +677,7 @@ func TestReadWithoutSession(t *testing.T) {
 }
 
 func TestMultipleOutputs(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -613,7 +706,7 @@ func TestMultipleOutputs(t *testing.T) {
 }
 
 func TestLargeData(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -660,7 +753,7 @@ func TestReadResult(t *testing.T) {
 }
 
 func TestProcessResult(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -687,7 +780,7 @@ func TestProcessResult(t *testing.T) {
 }
 
 func TestToOutput(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -706,7 +799,7 @@ func TestToOutput(t *testing.T) {
 }
 
 func TestCopyOutputTo(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -791,8 +884,8 @@ func TestReadLines(t *testing.T) {
 }
 
 func TestSessionCleanup(t *testing.T) {
-	t.Run("cleans up bytes storage", func(t *testing.T) {
-		mgr, _ := NewIoManager("", StorageMemory)
+	t.Run("cleans up memory storage", func(t *testing.T) {
+		mgr, _ := NewIoManager("", Memory)
 		defer mgr.Cleanup()
 		ses, _ := mgr.NewSession()
 		ctx := WithSession(context.Background(), ses)
@@ -814,7 +907,7 @@ func TestSessionCleanup(t *testing.T) {
 
 	t.Run("cleans up file storage", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		mgr, _ := NewIoManager(tmpDir, StorageFile)
+		mgr, _ := NewIoManager(tmpDir, File)
 		defer mgr.Cleanup()
 		ses, _ := mgr.NewSession()
 		ctx := WithSession(context.Background(), ses)
@@ -853,14 +946,33 @@ func TestFileReaderCleanup(t *testing.T) {
 }
 
 func TestBytesReaderCleanup(t *testing.T) {
-	data := []byte("test data")
-	br := NewBytesReader(data)
+	t.Run("keeps data by default", func(t *testing.T) {
+		data := []byte("test data")
+		br := NewBytesReader(data)
 
-	br.Cleanup()
+		br.Cleanup()
 
-	if br.Data() != nil {
-		t.Error("BytesReader.Cleanup should set Data to nil")
-	}
+		// After cleanup, data should remain for reuse (GC will handle it)
+		if br.Data() == nil {
+			t.Error("BytesReader.Cleanup should keep data for reuse")
+		}
+
+		// Verify data is still accessible and can be reused
+		if string(br.Data()) != "test data" {
+			t.Errorf("Data mismatch: got %s, want test data", br.Data())
+		}
+	})
+
+	t.Run("releases data with option", func(t *testing.T) {
+		data := []byte("test data")
+		br := NewBytesReader(data, WithReleaseOnCleanup())
+
+		br.Cleanup()
+
+		if br.Data() != nil {
+			t.Error("BytesReader.Cleanup should release data when configured")
+		}
+	})
 }
 
 func TestIOReader(t *testing.T) {
@@ -906,7 +1018,7 @@ func TestIOReader(t *testing.T) {
 }
 
 func TestManagerClosed(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	mgr.Cleanup()
 
 	_, err := mgr.NewSession()
@@ -916,7 +1028,7 @@ func TestManagerClosed(t *testing.T) {
 }
 
 func TestSessionClosed(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	ses.Cleanup()
@@ -952,8 +1064,8 @@ func TestGetFileSizeByReader(t *testing.T) {
 	})
 }
 
-func BenchmarkStorageBytesProcess(b *testing.B) {
-	mgr, _ := NewIoManager("", StorageMemory)
+func BenchmarkStorageMemoryProcess(b *testing.B) {
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 
 	data := bytes.Repeat([]byte("x"), 1024) // 1KB
@@ -974,9 +1086,9 @@ func BenchmarkStorageBytesProcess(b *testing.B) {
 	}
 }
 
-func BenchmarkStorageFileProcess(b *testing.B) {
+func BenchmarkFileProcess(b *testing.B) {
 	tmpDir := b.TempDir()
-	mgr, _ := NewIoManager(tmpDir, StorageFile)
+	mgr, _ := NewIoManager(tmpDir, File)
 	defer mgr.Cleanup()
 
 	data := bytes.Repeat([]byte("x"), 1024) // 1KB
@@ -1257,17 +1369,17 @@ func TestURLReader(t *testing.T) {
 }
 
 func TestManagerBaseDirAndSessionDir(t *testing.T) {
-	mgr, err := NewIoManager("", StorageMemory)
+	mgr, err := NewIoManager("", Memory)
 	if err != nil {
 		t.Fatalf("NewIoManager: %v", err)
 	}
 	defer mgr.Cleanup()
 
-	if mgr.(*manager).BaseDir() != "" {
-		t.Fatalf("BaseDir should be empty for memory storage")
+	if mgr.(*manager).BaseDir() == "" {
+		t.Fatalf("BaseDir should be set for memory storage")
 	}
 
-	fileMgr, err := NewIoManager("", StorageFile)
+	fileMgr, err := NewIoManager("", File)
 	if err != nil {
 		t.Fatalf("NewIoManager: %v", err)
 	}
@@ -1307,12 +1419,12 @@ func TestNopCloser(t *testing.T) {
 }
 
 func TestOutputOpenReaderWriterErrors(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	iSes := ses.(*ioSession)
 
-	out, err := iSes.newOutputWithStorage(".txt", StorageMemory)
+	out, err := iSes.newOutputWithStorage(".txt", Memory)
 	if err != nil {
 		t.Fatalf("newOutputWithStorage: %v", err)
 	}
@@ -1328,7 +1440,7 @@ func TestOutputOpenReaderWriterErrors(t *testing.T) {
 
 func TestOutputDataFileStorageNil(t *testing.T) {
 	tmpDir := t.TempDir()
-	mgr, _ := NewIoManager(tmpDir, StorageFile)
+	mgr, _ := NewIoManager(tmpDir, File)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -1448,7 +1560,7 @@ func TestReadListAndProcessListErrors(t *testing.T) {
 		t.Fatalf("expected error for nil ReadList func")
 	}
 
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -1734,7 +1846,7 @@ func TestURLReaderOptionsWithTimeout(t *testing.T) {
 }
 
 func TestProcessListEmptySourcesError(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -1760,7 +1872,7 @@ func TestReadListEmptySourcesError(t *testing.T) {
 }
 
 func TestProcessListErrorCleanup(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -1804,7 +1916,7 @@ func TestProcessListErrorCleanup(t *testing.T) {
 }
 
 func TestBindProcessWithMultipleSources(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -1877,7 +1989,7 @@ func TestBindReadResultReturnsValue(t *testing.T) {
 }
 
 func TestProcessWithContextCancellation(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -1906,7 +2018,7 @@ func TestProcessWithContextCancellation(t *testing.T) {
 }
 
 func TestOutputAsReaderAt(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
@@ -1942,7 +2054,7 @@ func TestOutputAsReaderAt(t *testing.T) {
 }
 
 func TestMultipleSessionsConcurrent(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 
 	var wg sync.WaitGroup
@@ -1981,7 +2093,7 @@ func TestMultipleSessionsConcurrent(t *testing.T) {
 }
 
 func TestReadListWithMixedSources(t *testing.T) {
-	mgr, _ := NewIoManager("", StorageMemory)
+	mgr, _ := NewIoManager("", Memory)
 	defer mgr.Cleanup()
 	ses, _ := mgr.NewSession()
 	defer ses.Cleanup()
