@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2131,4 +2134,264 @@ func TestReadListWithMixedSources(t *testing.T) {
 			t.Errorf("result[%d] = %q, want %q", i, results[i], want)
 		}
 	}
+}
+
+func TestMemoryLeakSmoke(t *testing.T) {
+	if os.Getenv("SIO_LEAK_CHECK") == "" {
+		t.Skip("set SIO_LEAK_CHECK=1 to enable leak check")
+	}
+
+	iterations := getenvInt("SIO_LEAK_ITERS", 200)
+	size := getenvInt("SIO_LEAK_SIZE", 512*1024) // 512KB
+	maxDeltaMB := getenvInt("SIO_LEAK_MAX_MB", 32)
+
+	baseline := readHeapAlloc()
+
+	mgr, err := NewIoManager("", Memory)
+	if err != nil {
+		t.Fatalf("NewIoManager: %v", err)
+	}
+
+	for i := 0; i < iterations; i++ {
+		ses, err := mgr.NewSession()
+		if err != nil {
+			_ = mgr.Cleanup()
+			t.Fatalf("NewSession: %v", err)
+		}
+
+		ctx := WithSession(context.Background(), ses)
+		if err := runLeakOps(ctx, size); err != nil {
+			_ = ses.Cleanup()
+			_ = mgr.Cleanup()
+			t.Fatalf("runLeakOps: %v", err)
+		}
+		if err := ses.Cleanup(); err != nil {
+			_ = mgr.Cleanup()
+			t.Fatalf("Cleanup: %v", err)
+		}
+	}
+
+	if err := mgr.Cleanup(); err != nil {
+		t.Fatalf("Manager Cleanup: %v", err)
+	}
+
+	after := readHeapAlloc()
+	var delta uint64
+	if after > baseline {
+		delta = after - baseline
+	}
+
+	t.Logf("heap baseline=%dMB after=%dMB delta=%dMB", baseline/(1024*1024), after/(1024*1024), delta/(1024*1024))
+	if delta > uint64(maxDeltaMB)*1024*1024 {
+		t.Fatalf("heap grew by %dMB (limit %dMB)", delta/(1024*1024), maxDeltaMB)
+	}
+}
+
+func getenvInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func readHeapAlloc() uint64 {
+	runtime.GC()
+	debug.FreeOSMemory()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
+}
+
+func runLeakOps(ctx context.Context, size int) error {
+	data := bytes.Repeat([]byte("x"), size)
+
+	out, err := Process(ctx, NewBytesReader(data, WithReleaseOnCleanup()), Out(".bin"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	_ = out.Data()
+
+	_, err = ProcessList(ctx, []StreamReader{
+		NewBytesReader([]byte("a")),
+		NewBytesReader([]byte("b")),
+	}, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) error {
+		for _, r := range readers {
+			if _, err := io.Copy(w, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := Read(ctx, NewBytesReader([]byte("read")), func(ctx context.Context, r io.Reader) error {
+		_, err := io.ReadAll(r)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	if err := ReadList(ctx, []StreamReader{
+		NewBytesReader([]byte("x")),
+		NewBytesReader([]byte("y")),
+	}, func(ctx context.Context, readers []io.Reader) error {
+		for _, r := range readers {
+			if _, err := io.ReadAll(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := BindRead(ctx, func(ctx context.Context, b *Binder) error {
+		if _, err := b.Use(NewBytesReader([]byte("bind"))); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	_, err = BindProcess(ctx, Out(".txt"), func(ctx context.Context, b *Binder, w io.Writer) error {
+		r1, err := b.Use(NewBytesReader([]byte("bind1")))
+		if err != nil {
+			return err
+		}
+		r2, err := b.Use(NewBytesReader([]byte("bind2")))
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(w, r1); err != nil {
+			return err
+		}
+		_, err = io.Copy(w, r2)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	_, _, err = BindProcessResult[int](ctx, Out(".txt"), func(ctx context.Context, b *Binder, w io.Writer) (*int, error) {
+		r, err := b.Use(NewBytesReader([]byte("bind-result")))
+		if err != nil {
+			return nil, err
+		}
+		n, err := io.Copy(w, r)
+		if err != nil {
+			return nil, err
+		}
+		val := int(n)
+		return &val, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = BindReadResult[string](ctx, func(ctx context.Context, b *Binder) (*string, error) {
+		r, err := b.Use(NewBytesReader([]byte("bind-read")))
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		s := string(data)
+		return &s, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	if err := SendStream(ctx, NewBytesReader([]byte("stream")), &buf); err != nil {
+		return err
+	}
+
+	res, err := ToReaderAt(ctx, bytes.NewReader([]byte("readerat")), WithMaxMemoryBytes(16))
+	if err != nil {
+		return err
+	}
+	_ = res.Cleanup()
+
+	out, err = Process(ctx, NewBytesReader([]byte("readerat-out")), Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	ra, err := out.AsReaderAt(ctx, WithMaxMemoryBytes(16))
+	if err != nil {
+		return err
+	}
+	_ = ra.Cleanup()
+
+	_, err = ProcessAt(ctx, NewBytesReader([]byte("at")), Out(".txt"), func(ctx context.Context, ra io.ReaderAt, size int64, w io.Writer) error {
+		if size > 0 {
+			buf := make([]byte, size)
+			_, _ = ra.ReadAt(buf, 0)
+			_, err := w.Write(buf)
+			return err
+		}
+		return nil
+	}, WithMaxMemoryBytes(16))
+	if err != nil {
+		return err
+	}
+
+	_, err = ReadAt(ctx, NewBytesReader([]byte("read-at")), func(ctx context.Context, ra io.ReaderAt, size int64) (*int, error) {
+		if size == 0 {
+			return nil, nil
+		}
+		buf := make([]byte, size)
+		_, _ = ra.ReadAt(buf, 0)
+		val := len(buf)
+		return &val, nil
+	}, WithMaxMemoryBytes(16))
+	if err != nil {
+		return err
+	}
+
+	_, _, err = ProcessResult[int](ctx, NewBytesReader([]byte("result")), Out(".txt"), func(ctx context.Context, r io.Reader, w io.Writer) (*int, error) {
+		n, err := io.Copy(w, r)
+		if err != nil {
+			return nil, err
+		}
+		val := int(n)
+		return &val, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	_, _, err = ProcessListResult[int](ctx, []StreamReader{
+		NewBytesReader([]byte("1")),
+		NewBytesReader([]byte("2")),
+	}, Out(".txt"), func(ctx context.Context, readers []io.Reader, w io.Writer) (*int, error) {
+		var total int64
+		for _, r := range readers {
+			n, err := io.Copy(w, r)
+			if err != nil {
+				return nil, err
+			}
+			total += n
+		}
+		val := int(total)
+		return &val, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
