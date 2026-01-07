@@ -75,6 +75,8 @@ func Configure(config Config) error {
 	return nil
 }
 
+type Void struct{}
+
 /* -------------------------------------------------------------------------- */
 /*                                   Errors                                    */
 /* -------------------------------------------------------------------------- */
@@ -1506,5 +1508,270 @@ func JoinCleanup(fns ...func() error) func() error {
 func SafeClose(c io.Closer) {
 	if c != nil {
 		_ = c.Close()
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/*                            NewOutReuse Options                              */
+/* -------------------------------------------------------------------------- */
+
+type OutReuseOpt interface {
+	applyOutReuse(*outReuseCfg)
+}
+
+type OutReuseOptFunc func(*outReuseCfg)
+
+func (f OutReuseOptFunc) applyOutReuse(c *outReuseCfg) { f(c) }
+
+type outReuseCfg struct {
+	// default: cleanup old output before reuse/replace
+	cleanupOld bool
+
+	// default: keep capacity of memory buffer (reuse) to reduce allocs
+	keepMemCap bool
+
+	// optional: if set and storage is Memory, cap the buffer capacity after finalize/reset
+	// (helps avoid “buffer stays huge forever”)
+	maxMemCap int64
+}
+
+// WithCleanupOld controls whether to cleanup the previous output before reuse.
+// Default: true.
+func WithCleanupOld(v bool) OutReuseOpt {
+	return OutReuseOptFunc(func(c *outReuseCfg) { c.cleanupOld = v })
+}
+
+// WithKeepMemCap controls whether to keep the previous memory buffer capacity on reuse.
+// Default: true.
+func WithKeepMemCap(v bool) OutReuseOpt {
+	return OutReuseOptFunc(func(c *outReuseCfg) { c.keepMemCap = v })
+}
+
+// WithMaxMemCap caps memory buffer capacity (bytes) on reuse/finalize.
+// 0 means disabled.
+func WithMaxMemCap(bytes int64) OutReuseOpt {
+	return OutReuseOptFunc(func(c *outReuseCfg) { c.maxMemCap = bytes })
+}
+
+// WithStorage is a convenience option for OutConfig (same style as your Out()).
+func WithStorage(st StorageType) OutOption { return st }
+
+// WithOut is a convenience to make call sites read nicely.
+// Example: s.NewOutReuse(&out, fio.WithOut(".pdf"), fio.WithStorage(fio.Memory))
+func WithOut(ext string, opts ...OutOption) OutConfig { return Out(ext, opts...) }
+
+/* -------------------------------------------------------------------------- */
+/*                       Reusable in-memory writer (bytes)                     */
+/* -------------------------------------------------------------------------- */
+
+// memWriteCloser writes into a reusable buffer and commits to Output on Close.
+type memWriteCloser struct {
+	buf    *bytes.Buffer
+	output *Output
+	cfg    outReuseCfg
+}
+
+func (w *memWriteCloser) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
+func (w *memWriteCloser) Close() error {
+	if w.output == nil {
+		return nil
+	}
+
+	// Commit bytes into output.data
+	w.output.mu.Lock()
+	w.output.data = w.buf.Bytes()
+	w.output.mu.Unlock()
+
+	// Optional cap: shrink buffer if too large
+	if w.cfg.maxMemCap > 0 {
+		if int64(w.buf.Cap()) > w.cfg.maxMemCap {
+			// shrink to exact size (or max cap) to release memory
+			b := w.output.data
+			limit := w.cfg.maxMemCap
+			if int64(len(b)) < limit {
+				limit = int64(len(b))
+			}
+			nb := make([]byte, 0, limit)
+			nb = append(nb, b...)
+			// replace buffer and output data
+			w.buf = bytes.NewBuffer(nb)
+			w.output.mu.Lock()
+			w.output.data = w.buf.Bytes()
+			w.output.mu.Unlock()
+		}
+	}
+
+	return nil
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Scope.NewOutReuse                             */
+/* -------------------------------------------------------------------------- */
+
+// NewOutReuse creates an output writer that reuses a previously produced *Output.
+//
+// Key behavior:
+// - If *outPtr is non-nil, it will be cleaned up (by default) and replaced/reused.
+// - For Memory storage: reuses the underlying bytes.Buffer capacity to avoid reallocs.
+// - For File storage: always creates a new temp file under the session dir (then swaps).
+//
+// IMPORTANT: To actually reduce RAM usage, callers must NOT keep references to older outputs.
+// Pass the same `out` variable pointer each time and overwrite it.
+func (s *Scope) NewOutReuse(outPtr **Output, cfg OutConfig, opts ...OutReuseOpt) io.Writer {
+	if s == nil {
+		return errWriter{errors.New("fio: nil scope")}
+	}
+	if s.outHandle != nil {
+		err := errors.New("fio: NewOutReuse called more than once")
+		s.err = errors.Join(s.err, err)
+		return errWriter{err}
+	}
+	if outPtr == nil {
+		err := errors.New("fio: outPtr is nil")
+		s.err = errors.Join(s.err, err)
+		return errWriter{err}
+	}
+
+	// defaults
+	rcfg := outReuseCfg{
+		cleanupOld: true,
+		keepMemCap: true,
+		maxMemCap:  0,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt.applyOutReuse(&rcfg)
+		}
+	}
+
+	// Require session
+	ses := Session(s.ctx)
+	if ses == nil {
+		err := ErrNoSession
+		s.err = errors.Join(s.err, err)
+		return errWriter{err}
+	}
+	iSes, ok := ses.(*ioSession)
+	if !ok {
+		err := ErrInvalidSessionType
+		s.err = errors.Join(s.err, err)
+		return errWriter{err}
+	}
+	if err := iSes.ensureOpen(); err != nil {
+		s.err = errors.Join(s.err, err)
+		return errWriter{err}
+	}
+
+	// Decide storage type (same rule as NewOut; no sizeHint here because we want reuse)
+	storageType := iSes.storageType
+	if cfg.storageType != nil {
+		storageType = *cfg.storageType
+	}
+
+	// Try reuse if existing output matches desired storage.
+	prev := *outPtr
+
+	// Optionally cleanup old output early (prevents accumulation)
+	// If we will reuse buffer/file, we "reset" instead of full cleanup.
+	if prev != nil && rcfg.cleanupOld {
+		// If same storage and reusable path exists, we reset (cheaper).
+		// Otherwise, cleanup fully.
+		if prev.StorageType() != storageType {
+			_ = prev.cleanup()
+			prev = nil
+			*outPtr = nil
+		}
+	}
+
+	// Ensure we have an Output object for this storage
+	var out *Output
+	if prev != nil && prev.StorageType() == storageType {
+		out = prev
+		// Mark as not closed (it might be "open" already; we just reset content)
+		out.mu.Lock()
+		out.closed = false
+		out.keep = false // reuse resets keep unless caller calls Keep() again
+		out.mu.Unlock()
+	} else {
+		// create new output from session
+		newOut, err := iSes.newOutputWithStorage(cfg.ext, storageType)
+		if err != nil {
+			s.err = errors.Join(s.err, err)
+			return errWriter{err}
+		}
+		out = newOut
+		*outPtr = out
+	}
+
+	// Create writer
+	switch storageType {
+	case Memory:
+		// Build/Reuse buffer capacity
+		var buf *bytes.Buffer
+
+		out.mu.Lock()
+		// Grab old data slice; safe to reuse its capacity by creating a buffer on it
+		oldData := out.data
+		// Reset output content for new write
+		out.data = nil
+		out.closed = false
+		out.mu.Unlock()
+
+		if rcfg.keepMemCap && cap(oldData) > 0 {
+			// reuse underlying array capacity
+			b := oldData[:0]
+			buf = bytes.NewBuffer(b)
+		} else {
+			buf = &bytes.Buffer{}
+		}
+
+		wc := &memWriteCloser{
+			buf:    buf,
+			output: out,
+			cfg:    rcfg,
+		}
+
+		s.outHandle = &OutHandle{
+			W:       wc,
+			output:  out,
+			session: iSes,
+		}
+		// On finalize/cleanup, OutHandle will call wc.Close() then keep output
+		return wc
+
+	default: // File
+		// If we are reusing an existing file output, remove old file first (to avoid disk leak)
+		if prev != nil && prev.StorageType() == File && rcfg.cleanupOld {
+			_ = prev.cleanup()
+			// cleanup marks closed=true; we'll reopen by creating a new file below
+			out = nil
+		}
+
+		if out == nil {
+			newOut, err := iSes.newOutputWithStorage(cfg.ext, File)
+			if err != nil {
+				s.err = errors.Join(s.err, err)
+				return errWriter{err}
+			}
+			out = newOut
+			*outPtr = out
+		}
+
+		w, err := out.OpenWriter()
+		if err != nil {
+			_ = out.cleanup()
+			s.err = errors.Join(s.err, err)
+			return errWriter{err}
+		}
+
+		s.outHandle = &OutHandle{
+			W:       w,
+			output:  out,
+			session: iSes,
+		}
+		return w
 	}
 }

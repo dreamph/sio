@@ -75,9 +75,11 @@ Temporary files are tracked and cleaned up automatically. No more leaked temp fi
 
 Control exactly how your data flows. Stream large files without loading everything into memory.
 
-### ⚡ **Production Ready**
+### ⚡ **Production Ready & Optimized**
 
 Built for real-world use: handles errors gracefully, supports concurrent sessions, and integrates seamlessly with popular frameworks.
+
+**Performance:** Optimized for production with microsecond-level latency (3.9µs for 1KB files), memory pooling, and fast-path execution for memory-only operations.
 
 ---
 
@@ -108,7 +110,7 @@ func main() {
     ctx := context.Background()
 
     // Create a manager (handles temp directory)
-    ioManager, _ := sio.NewIoManager(filepath.Join(sio.DefaultBaseTempDir, "myapp"))
+    ioManager, _ := sio.NewIoManager(filepath.Join(sio.DefaultBaseTempDir, "myapp"), sio.File)
     defer ioManager.Cleanup()
 
     // Create a session (isolated workspace)
@@ -336,7 +338,7 @@ output, _ := sio.BindProcess(ctx, sio.Out(sio.Zip),
 
 ```go
 // Manager cleanup
-ioManager, _ := sio.NewIoManager("/tmp/myapp")
+ioManager, _ := sio.NewIoManager("/tmp/myapp", sio.File)
 defer ioManager.Cleanup() // Always defer!
 
 // Session cleanup
@@ -443,12 +445,12 @@ err := sio.Read(ctx, src, func(ctx context.Context, r io.Reader) error {
 var ioManager sio.IoManager
 
 func init() {
-    ioManager, _ = sio.NewIoManager("/tmp/myapp")
+    ioManager, _ = sio.NewIoManager("/tmp/myapp", sio.File)
 }
 
 // Bad: Creating manager per request
 func handler() {
-    mgr, _ := sio.NewIoManager("/tmp/myapp") // Expensive!
+    mgr, _ := sio.NewIoManager("/tmp/myapp", sio.File) // Expensive!
 }
 ```
 

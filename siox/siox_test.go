@@ -19,7 +19,7 @@ import (
 func newSessionCtx(t *testing.T) context.Context {
 	t.Helper()
 
-	mgr, err := sio.NewIoManager("", sio.StorageMemory)
+	mgr, err := sio.NewIoManager("", sio.Memory)
 	if err != nil {
 		t.Fatalf("NewIoManager: %v", err)
 	}
