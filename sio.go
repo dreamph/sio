@@ -1,32 +1,3 @@
-// Package sio provides streaming I/O utilities with session management,
-// automatic resource cleanup, and flexible storage backends (memory/file).
-//
-// It offers multiple API styles:
-//
-//   - One-liners: Copy, Transform, TransformAt
-//   - Manual control: OpenIn, NewOut, Finalize
-//   - Callback-based: Process, Read (guaranteed cleanup)
-//   - Binder pattern: BindProcess, BindRead (multiple inputs)
-//
-// Basic usage:
-//
-//	mgr, _ := NewIoManager("./temp", Memory)
-//	defer mgr.Cleanup()
-//
-//	ses, _ := mgr.NewSession()
-//	defer ses.Cleanup()
-//
-//	ctx := WithSession(context.Background(), ses)
-//
-//	// One-liner style
-//	out, err := Transform(ctx, "./input.pdf", Out(".pdf"), compressPDF)
-//
-//	// Manual style
-//	in, _ := OpenIn(ctx, "./input.pdf")
-//	defer in.Close()
-//	oh, _ := NewOut(ctx, Out(".pdf"))
-//	io.Copy(oh.W, in.R)
-//	out, _ := oh.Finalize()
 package sio
 
 import (
@@ -1909,6 +1880,12 @@ func SizeFromStream(sr StreamReader) int64 {
 		return s.Size()
 	}
 	return -1
+}
+
+// SizeStream returns size from StreamReader without reading.
+// Returns -1 if size cannot be determined.
+func SizeStream(sr StreamReader) int64 {
+	return SizeFromStream(sr)
 }
 
 // SizeFromStreamList sums sizes for known readers.

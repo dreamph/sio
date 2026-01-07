@@ -1152,6 +1152,10 @@ type seekOnlyReader struct {
 	pos  int64
 }
 
+type noSizeReader struct{}
+
+func (noSizeReader) Read(p []byte) (int, error) { return 0, io.EOF }
+
 func (s *seekOnlyReader) Read(p []byte) (int, error) {
 	if s.pos >= int64(len(s.data)) {
 		return 0, io.EOF
@@ -1622,7 +1626,7 @@ func TestSizeAndSizeHelpers(t *testing.T) {
 	if got := SizeFromStream(NewBytesReader([]byte("x"))); got != 1 {
 		t.Fatalf("SizeFromStream = %d", got)
 	}
-	if got := SizeFromStream(NewGenericReader(strings.NewReader("x"))); got != -1 {
+	if got := SizeFromStream(NewGenericReader(noSizeReader{})); got != -1 {
 		t.Fatalf("SizeFromStream for non-sizer = %d", got)
 	}
 
