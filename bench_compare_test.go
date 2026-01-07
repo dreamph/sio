@@ -20,6 +20,7 @@ type sourceFactory struct {
 	name    string
 	makeFio func() fio.Source
 	makeSR  func() sio.StreamReader
+	open    func() (io.ReadCloser, error)
 	cleanup func()
 }
 
@@ -32,6 +33,7 @@ func newSourceFactory(b *testing.B, kind string, data []byte) sourceFactory {
 			name:    "bytes",
 			makeFio: func() fio.Source { return fio.BytesSource(data) },
 			makeSR:  func() sio.StreamReader { return sio.NewBytesReader(data) },
+			open:    func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil },
 			cleanup: func() {
 				// no-op
 			},
@@ -46,6 +48,7 @@ func newSourceFactory(b *testing.B, kind string, data []byte) sourceFactory {
 			name:    "file",
 			makeFio: func() fio.Source { return fio.PathSource(path) },
 			makeSR:  func() sio.StreamReader { return sio.NewFileReader(path) },
+			open:    func() (io.ReadCloser, error) { return os.Open(path) },
 			cleanup: func() {
 				// temp dir cleanup handled by testing
 			},
@@ -59,6 +62,13 @@ func newSourceFactory(b *testing.B, kind string, data []byte) sourceFactory {
 			name:    "url",
 			makeFio: func() fio.Source { return fio.URLSource(srv.URL) },
 			makeSR:  func() sio.StreamReader { return sio.NewURLReader(srv.URL) },
+			open: func() (io.ReadCloser, error) {
+				resp, err := http.Get(srv.URL)
+				if err != nil {
+					return nil, err
+				}
+				return resp.Body, nil
+			},
 			cleanup: func() {
 				srv.Close()
 			},
@@ -67,6 +77,63 @@ func newSourceFactory(b *testing.B, kind string, data []byte) sourceFactory {
 		b.Fatalf("unknown source kind: %s", kind)
 	}
 	return sourceFactory{}
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (n nopWriteCloser) Close() error { return nil }
+
+func benchNormalCopy(b *testing.B, size int, storage string, src sourceFactory, opsPerSession int) {
+	b.Helper()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	dir := ""
+	if storage == "file" {
+		dir = b.TempDir()
+	}
+
+	for i := 0; i < b.N; {
+		for j := 0; j < opsPerSession && i < b.N; j++ {
+			r, err := src.open()
+			if err != nil {
+				b.Fatalf("open: %v", err)
+			}
+
+			var (
+				w       io.WriteCloser
+				cleanup func()
+			)
+			switch storage {
+			case "memory":
+				w = nopWriteCloser{Writer: &bytes.Buffer{}}
+			case "file":
+				f, err := os.CreateTemp(dir, "normal-*")
+				if err != nil {
+					_ = r.Close()
+					b.Fatalf("CreateTemp: %v", err)
+				}
+				cleanup = func() { _ = os.Remove(f.Name()) }
+				w = f
+			default:
+				_ = r.Close()
+				b.Fatalf("unknown storage: %s", storage)
+			}
+
+			_, err = io.Copy(w, r)
+			_ = r.Close()
+			_ = w.Close()
+			if cleanup != nil {
+				cleanup()
+			}
+			if err != nil {
+				b.Fatalf("copy: %v", err)
+			}
+			i++
+		}
+	}
 }
 
 func benchFioDo(b *testing.B, size int, storage fio.StorageType, src sourceFactory, opsPerSession int) {
@@ -195,6 +262,13 @@ func BenchmarkCompareFioSio(b *testing.B) {
 			for _, storage := range storages {
 				for _, opsPerSession := range opsPerSessionList {
 					label := fmt.Sprintf("ops%d", opsPerSession)
+					if sourceKind != "url" {
+						b.Run("normal/"+sourceKind+"/"+storage.name+"/"+sizeLabel+"/"+label, func(b *testing.B) {
+							src := newSourceFactory(b, sourceKind, data)
+							defer src.cleanup()
+							benchNormalCopy(b, size, storage.name, src, opsPerSession)
+						})
+					}
 					b.Run("fio/"+sourceKind+"/"+storage.name+"/"+sizeLabel+"/"+label, func(b *testing.B) {
 						src := newSourceFactory(b, sourceKind, data)
 						defer src.cleanup()
