@@ -60,7 +60,7 @@ func newServerApp(ioManager sio.IoManager) (*fiber.App, error) {
 }
 
 func main() {
-	ioManager, err := sio.NewIoManager(filepath.Join(sio.DefaultBaseTempDir, "test1"))
+	ioManager, err := sio.NewIoManager(filepath.Join(sio.DefaultBaseTempDir, "test1"), sio.File)
 	if err != nil {
 		log.Fatal(err)
 	}
