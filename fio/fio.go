@@ -128,6 +128,12 @@ type Input struct {
 	Kind    string
 	Path    string
 	cleanup func() error
+
+	// Reusable support
+	reusable   bool
+	needsReset bool        // true after first use
+	ra         io.ReaderAt // for reusable inputs
+	data       []byte      // for memory-backed reusable
 }
 
 func (in *Input) Close() error {
@@ -143,22 +149,145 @@ func (in *Input) Close() error {
 		errs = errors.Join(errs, in.cleanup())
 		in.cleanup = nil
 	}
+	// Clear reusable data
+	in.ra = nil
+	in.data = nil
+	in.needsReset = false
 	return errs
 }
 
+// Reset resets the reader to beginning (for reusable inputs).
+// Returns error if input is not reusable.
+func (in *Input) Reset() error {
+	if in == nil {
+		return errors.New("fio: nil input")
+	}
+	if !in.reusable {
+		return errors.New("fio: input is not reusable")
+	}
+
+	// Skip reset if not needed (first use or already reset)
+	if !in.needsReset {
+		return nil
+	}
+
+	// Memory-backed
+	if in.data != nil {
+		in.R = io.NopCloser(bytes.NewReader(in.data))
+		in.needsReset = false
+		return nil
+	}
+
+	// ReaderAt-backed (file)
+	if in.ra != nil {
+		in.R = &readerAtCloser{
+			r:      io.NewSectionReader(in.ra, 0, in.Size),
+			closer: nil, // don't close underlying ra
+		}
+		in.needsReset = false
+		return nil
+	}
+
+	// Seeker-backed
+	if seeker, ok := in.R.(io.Seeker); ok {
+		_, err := seeker.Seek(0, io.SeekStart)
+		if err == nil {
+			in.needsReset = false
+		}
+		return err
+	}
+
+	return errors.New("fio: cannot reset input")
+}
+
+// markUsed marks the input as used (needs reset before next use).
+// Called automatically by Scope.Open.
+func (in *Input) markUsed() {
+	if in != nil && in.reusable {
+		in.needsReset = true
+	}
+}
+
+// IsReusable returns true if input can be reset and reused.
+func (in *Input) IsReusable() bool {
+	return in != nil && in.reusable
+}
+
+// ReaderAt returns io.ReaderAt if available (for random access).
+// Returns nil if input doesn't support random access.
+// Available for: files, []byte, reusable inputs.
+func (in *Input) ReaderAt() io.ReaderAt {
+	if in == nil {
+		return nil
+	}
+
+	// Reusable with ReaderAt
+	if in.ra != nil {
+		return in.ra
+	}
+
+	// Memory-backed
+	if in.data != nil {
+		return bytes.NewReader(in.data)
+	}
+
+	// Check if underlying reader supports ReaderAt
+	if ra, ok := in.R.(io.ReaderAt); ok {
+		return ra
+	}
+
+	return nil
+}
+
+// HasReaderAt returns true if ReaderAt() will return non-nil.
+func (in *Input) HasReaderAt() bool {
+	return in.ReaderAt() != nil
+}
+
+// readerAtCloser wraps SectionReader with optional closer
+type readerAtCloser struct {
+	r      *io.SectionReader
+	closer io.Closer
+}
+
+func (r *readerAtCloser) Read(p []byte) (int, error) { return r.r.Read(p) }
+func (r *readerAtCloser) Close() error {
+	if r.closer != nil {
+		return r.closer.Close()
+	}
+	return nil
+}
+
+/* -------------------------------------------------------------------------- */
+/*                              Input Options                                  */
+/* -------------------------------------------------------------------------- */
+
+// InOption configures OpenIn behavior.
+type InOption func(*inConfig)
+
+type inConfig struct {
+	reusable bool
+}
+
+// Reusable makes the input reusable across multiple Do() calls.
+// The input will buffer data in memory or use ReaderAt for files.
+func Reusable() InOption {
+	return func(c *inConfig) {
+		c.reusable = true
+	}
+}
+
 // OpenIn opens any source type and returns an Input.
-//
-// Supported types:
-//   - string: file path or URL (auto-detected)
-//   - *multipart.FileHeader: multipart upload
-//   - *os.File: open file handle
-//   - []byte: in-memory bytes
-//   - io.Reader / io.ReadCloser: generic reader
-//   - *Output: output as input (via OpenReader)
-//   - *Input: returns as-is
-func OpenIn(ctx context.Context, src any) (*Input, error) {
+func OpenIn(ctx context.Context, src any, opts ...InOption) (*Input, error) {
 	if src == nil {
 		return nil, ErrNilSource
+	}
+
+	cfg := &inConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(cfg)
+		}
 	}
 
 	switch v := src.(type) {
@@ -173,10 +302,21 @@ func OpenIn(ctx context.Context, src any) (*Input, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Input{R: rc, Size: v.Size(), Kind: KindStream, Path: v.Path()}, nil
+		in := &Input{R: rc, Size: v.Size(), Kind: KindStream, Path: v.Path()}
+		if cfg.reusable {
+			return makeReusable(in)
+		}
+		return in, nil
 
 	case string:
-		return openString(ctx, v)
+		in, err := openString(ctx, v)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.reusable {
+			return makeReusable(in)
+		}
+		return in, nil
 
 	case *multipart.FileHeader:
 		if v == nil {
@@ -186,26 +326,101 @@ func OpenIn(ctx context.Context, src any) (*Input, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Input{R: rc, Size: v.Size, Kind: KindMultipart}, nil
+		in := &Input{R: rc, Size: v.Size, Kind: KindMultipart}
+		if cfg.reusable {
+			return makeReusable(in)
+		}
+		return in, nil
 
 	case *os.File:
 		if v == nil {
 			return nil, errors.New("fio: nil *os.File")
 		}
-		return &Input{R: v, Size: fileSize(v), Kind: KindFile, Path: v.Name()}, nil
+		in := &Input{R: v, Size: fileSize(v), Kind: KindFile, Path: v.Name()}
+		if cfg.reusable {
+			return makeReusableFile(in, v)
+		}
+		return in, nil
 
 	case []byte:
-		return &Input{R: io.NopCloser(bytes.NewReader(v)), Size: int64(len(v)), Kind: KindMemory}, nil
+		in := &Input{
+			R:        io.NopCloser(bytes.NewReader(v)),
+			Size:     int64(len(v)),
+			Kind:     KindMemory,
+			reusable: true, // bytes are inherently reusable
+			data:     v,
+		}
+		return in, nil
 
 	case io.ReadCloser:
-		return &Input{R: v, Size: SizeAny(v), Kind: KindReader}, nil
+		in := &Input{R: v, Size: SizeAny(v), Kind: KindReader}
+		if cfg.reusable {
+			return makeReusable(in)
+		}
+		return in, nil
 
 	case io.Reader:
-		return &Input{R: io.NopCloser(v), Size: SizeAny(v), Kind: KindReader}, nil
+		in := &Input{R: io.NopCloser(v), Size: SizeAny(v), Kind: KindReader}
+		if cfg.reusable {
+			return makeReusable(in)
+		}
+		return in, nil
 
 	default:
 		return nil, fmt.Errorf("fio: unsupported source type %T", src)
 	}
+}
+
+// makeReusable converts input to reusable by reading into memory
+func makeReusable(in *Input) (*Input, error) {
+	// Already reusable
+	if in.reusable {
+		return in, nil
+	}
+
+	// For files, use ReaderAt directly
+	if f, ok := in.R.(*os.File); ok {
+		return makeReusableFile(in, f)
+	}
+
+	// For other readers, buffer into memory
+	data, err := io.ReadAll(in.R)
+	if err != nil {
+		in.Close()
+		return nil, err
+	}
+	in.R.Close()
+
+	in.R = io.NopCloser(bytes.NewReader(data))
+	in.Size = int64(len(data))
+	in.data = data
+	in.reusable = true
+	return in, nil
+}
+
+// makeReusableFile makes file input reusable via ReaderAt
+func makeReusableFile(in *Input, f *os.File) (*Input, error) {
+	size := fileSize(f)
+	if size < 0 {
+		// Can't determine size, fall back to memory
+		return makeReusable(in)
+	}
+
+	// Seek to beginning
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return makeReusable(in)
+	}
+
+	in.ra = f
+	in.Size = size
+	in.reusable = true
+	in.R = &readerAtCloser{
+		r:      io.NewSectionReader(f, 0, size),
+		closer: nil,
+	}
+	in.cleanup = f.Close // close file when input is closed
+
+	return in, nil
 }
 
 func openString(ctx context.Context, s string) (*Input, error) {
@@ -609,6 +824,17 @@ type Scope struct {
 
 // Open opens source and returns reader. Cleanup is automatic.
 func (s *Scope) Open(src any) io.Reader {
+	// If src is reusable *Input, reset if needed and use directly
+	if in, ok := src.(*Input); ok && in.IsReusable() {
+		if err := in.Reset(); err != nil {
+			s.err = errors.Join(s.err, err)
+			return errReader{err}
+		}
+		in.markUsed() // mark for reset on next use
+		// Don't add cleanup - caller manages reusable input
+		return in.R
+	}
+
 	rc, cleanup, _, err := openReader(s.ctx, src)
 	if err != nil {
 		s.err = errors.Join(s.err, err)
@@ -622,6 +848,17 @@ func (s *Scope) Open(src any) io.Reader {
 
 // OpenSized opens source and returns reader + size.
 func (s *Scope) OpenSized(src any) (io.Reader, int64) {
+	// If src is reusable *Input, reset if needed and use directly
+	if in, ok := src.(*Input); ok && in.IsReusable() {
+		if err := in.Reset(); err != nil {
+			s.err = errors.Join(s.err, err)
+			return errReader{err}, -1
+		}
+		in.markUsed() // mark for reset on next use
+		// Don't add cleanup - caller manages reusable input
+		return in.R, in.Size
+	}
+
 	rc, cleanup, size, err := openReader(s.ctx, src)
 	if err != nil {
 		s.err = errors.Join(s.err, err)
@@ -631,6 +868,48 @@ func (s *Scope) OpenSized(src any) (io.Reader, int64) {
 		s.cleanups = append(s.cleanups, cleanup)
 	}
 	return rc, size
+}
+
+// OpenReaderAt opens source and returns ReaderAt + size.
+// For non-seekable sources, data is buffered into memory.
+func (s *Scope) OpenReaderAt(src any) (io.ReaderAt, int64) {
+	// If src is *Input with ReaderAt support
+	if in, ok := src.(*Input); ok {
+		if ra := in.ReaderAt(); ra != nil {
+			// Don't add cleanup for reusable - caller manages
+			if !in.IsReusable() {
+				s.cleanups = append(s.cleanups, in.Close)
+			}
+			return ra, in.Size
+		}
+	}
+
+	// Open and check for ReaderAt
+	rc, cleanup, size, err := openReader(s.ctx, src)
+	if err != nil {
+		s.err = errors.Join(s.err, err)
+		return nil, -1
+	}
+
+	// If already ReaderAt, use directly
+	if ra, ok := rc.(io.ReaderAt); ok {
+		if cleanup != nil {
+			s.cleanups = append(s.cleanups, cleanup)
+		}
+		return ra, size
+	}
+
+	// Buffer into memory for ReaderAt support
+	data, err := io.ReadAll(rc)
+	if cleanup != nil {
+		_ = cleanup()
+	}
+	if err != nil {
+		s.err = errors.Join(s.err, err)
+		return nil, -1
+	}
+
+	return bytes.NewReader(data), int64(len(data))
 }
 
 // NewOut creates output writer.
@@ -729,8 +1008,8 @@ func Copy(ctx context.Context, src any, out OutConfig) (*Output, error) {
 	return o, err
 }
 
-// Transform applies fn to src and writes to output.
-func Transform(ctx context.Context, src any, out OutConfig, fn func(r io.Reader, w io.Writer) error) (*Output, error) {
+// Process applies fn to src and writes to output.
+func Process(ctx context.Context, src any, out OutConfig, fn func(r io.Reader, w io.Writer) error) (*Output, error) {
 	if fn == nil {
 		return nil, ErrNilFunc
 	}
@@ -742,8 +1021,8 @@ func Transform(ctx context.Context, src any, out OutConfig, fn func(r io.Reader,
 	return o, err
 }
 
-// TransformResult applies fn and returns result.
-func TransformResult[T any](ctx context.Context, src any, out OutConfig, fn func(r io.Reader, w io.Writer) (T, error)) (*Output, T, error) {
+// ProcessResult applies fn and returns result.
+func ProcessResult[T any](ctx context.Context, src any, out OutConfig, fn func(r io.Reader, w io.Writer) (T, error)) (*Output, T, error) {
 	if fn == nil {
 		var zero T
 		return nil, zero, ErrNilFunc
@@ -755,8 +1034,42 @@ func TransformResult[T any](ctx context.Context, src any, out OutConfig, fn func
 	})
 }
 
-// Consume reads src without creating output.
-func Consume[T any](ctx context.Context, src any, fn func(r io.Reader) (T, error)) (T, error) {
+// ProcessAt applies fn with ReaderAt to src and writes to output.
+// Useful for formats requiring random access (PDF, ZIP, etc.)
+func ProcessAt(ctx context.Context, src any, out OutConfig, fn func(ra io.ReaderAt, size int64, w io.Writer) error) (*Output, error) {
+	if fn == nil {
+		return nil, ErrNilFunc
+	}
+	o, _, err := Do(ctx, func(s *Scope) (struct{}, error) {
+		ra, size := s.OpenReaderAt(src)
+		if ra == nil {
+			return struct{}{}, errors.New("fio: cannot get ReaderAt")
+		}
+		w := s.NewOut(out, size)
+		return struct{}{}, fn(ra, size, w)
+	})
+	return o, err
+}
+
+// ProcessAtResult applies fn with ReaderAt and returns result.
+func ProcessAtResult[T any](ctx context.Context, src any, out OutConfig, fn func(ra io.ReaderAt, size int64, w io.Writer) (T, error)) (*Output, T, error) {
+	if fn == nil {
+		var zero T
+		return nil, zero, ErrNilFunc
+	}
+	return Do(ctx, func(s *Scope) (T, error) {
+		ra, size := s.OpenReaderAt(src)
+		if ra == nil {
+			var zero T
+			return zero, errors.New("fio: cannot get ReaderAt")
+		}
+		w := s.NewOut(out, size)
+		return fn(ra, size, w)
+	})
+}
+
+// Read reads src without creating output.
+func Read[T any](ctx context.Context, src any, fn func(r io.Reader) (T, error)) (T, error) {
 	if fn == nil {
 		var zero T
 		return zero, ErrNilFunc
@@ -764,6 +1077,23 @@ func Consume[T any](ctx context.Context, src any, fn func(r io.Reader) (T, error
 	_, res, err := Do(ctx, func(s *Scope) (T, error) {
 		r := s.Open(src)
 		return fn(r)
+	})
+	return res, err
+}
+
+// ReadAt reads src as ReaderAt without creating output.
+func ReadAt[T any](ctx context.Context, src any, fn func(ra io.ReaderAt, size int64) (T, error)) (T, error) {
+	if fn == nil {
+		var zero T
+		return zero, ErrNilFunc
+	}
+	_, res, err := Do(ctx, func(s *Scope) (T, error) {
+		ra, size := s.OpenReaderAt(src)
+		if ra == nil {
+			var zero T
+			return zero, errors.New("fio: cannot get ReaderAt")
+		}
+		return fn(ra, size)
 	})
 	return res, err
 }
