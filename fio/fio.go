@@ -631,6 +631,18 @@ type ioSession struct {
 	autoThreshold int64
 }
 
+func resolveStorageType(out OutConfig, ses *ioSession, sizeHint int64) StorageType {
+	storageType := ses.storageType
+	if out.storageType != nil {
+		storageType = *out.storageType
+	} else if out.autoThreshold != nil && *out.autoThreshold > 0 && sizeHint >= *out.autoThreshold {
+		storageType = File
+	} else if sizeHint >= 0 && ses.autoThreshold > 0 && sizeHint >= ses.autoThreshold {
+		storageType = File
+	}
+	return storageType
+}
+
 func (s *ioSession) Dir() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -695,14 +707,7 @@ func (s *ioSession) NewOut(out OutConfig, sizeHint ...int64) (*Output, error) {
 		hint = sizeHint[0]
 	}
 
-	storageType := s.storageType
-	if out.storageType != nil {
-		storageType = *out.storageType
-	} else if out.autoThreshold != nil && *out.autoThreshold > 0 && hint >= *out.autoThreshold {
-		storageType = File
-	} else if hint >= 0 && s.autoThreshold > 0 && hint >= s.autoThreshold {
-		storageType = File
-	}
+	storageType := resolveStorageType(out, s, hint)
 
 	output, err := s.newOutput(out.ext, storageType)
 	if err != nil {
@@ -996,14 +1001,7 @@ func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, 
 		hint = sizeHint[0]
 	}
 
-	storageType := iSes.storageType
-	if out.storageType != nil {
-		storageType = *out.storageType
-	} else if out.autoThreshold != nil && *out.autoThreshold > 0 && hint >= *out.autoThreshold {
-		storageType = File
-	} else if hint >= 0 && iSes.autoThreshold > 0 && hint >= iSes.autoThreshold {
-		storageType = File
-	}
+	storageType := resolveStorageType(out, iSes, hint)
 
 	output, err := iSes.newOutput(out.ext, storageType)
 	if err != nil {
@@ -1038,6 +1036,15 @@ func (s *Scope) Use(src Source) io.Reader {
 		return errReader{err}
 	}
 
+	if b, ok := src.(bytesSource); ok {
+		if b == nil {
+			err := ErrNilSource
+			s.err = errors.Join(s.err, err)
+			return errReader{err}
+		}
+		return bytes.NewReader(b)
+	}
+
 	// reusable Input fast-path
 	if is, ok := src.(inputSource); ok && is.in != nil && is.in.IsReusable() {
 		if err := is.in.Reset(); err != nil {
@@ -1069,6 +1076,15 @@ func (s *Scope) UseSized(src Source) (io.Reader, int64) {
 		return errReader{err}, -1
 	}
 
+	if b, ok := src.(bytesSource); ok {
+		if b == nil {
+			err := ErrNilSource
+			s.err = errors.Join(s.err, err)
+			return errReader{err}, -1
+		}
+		return bytes.NewReader(b), int64(len(b))
+	}
+
 	if is, ok := src.(inputSource); ok && is.in != nil && is.in.IsReusable() {
 		if err := is.in.Reset(); err != nil {
 			s.err = errors.Join(s.err, err)
@@ -1091,14 +1107,9 @@ func (s *Scope) UseSized(src Source) (io.Reader, int64) {
 	return rc, size
 }
 
-// UseReaderAt returns ReaderAt + size with default ReaderAt options.
-func (s *Scope) UseReaderAt(src Source) (io.ReaderAt, int64) {
-	return s.UseReaderAtWithOptions(src)
-}
-
-// UseReaderAtWithOptions returns ReaderAt + size with options.
+// UseReaderAt returns ReaderAt + size with options.
 // Buffers into memory or spills to temp file based on options.
-func (s *Scope) UseReaderAtWithOptions(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64) {
+func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64) {
 	if src == nil {
 		err := ErrNilSource
 		s.err = errors.Join(s.err, err)
@@ -1509,7 +1520,7 @@ func ProcessAtResult[T any](ctx context.Context, src Source, out OutConfig, fn f
 		return nil, zero, ErrNilFunc
 	}
 	return DoOutResult(ctx, func(s *OutScope) (T, error) {
-		ra, size := s.UseReaderAtWithOptions(src, opts...)
+		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
 			return zero, errors.New("fio: cannot get ReaderAt")
 		}
@@ -1548,7 +1559,7 @@ func ProcessAt(ctx context.Context, src Source, out OutConfig, fn func(ra io.Rea
 		return nil, ErrNilFunc
 	}
 	return DoOut(ctx, func(s *OutScope) error {
-		ra, size := s.UseReaderAtWithOptions(src, opts...)
+		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
 			return errors.New("fio: cannot get ReaderAt")
 		}
@@ -1584,7 +1595,7 @@ func ReadAt[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt, size
 		return zero, ErrNilFunc
 	}
 	return Do(ctx, func(s *Scope) (T, error) {
-		ra, size := s.UseReaderAtWithOptions(src, opts...)
+		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
 			return zero, errors.New("fio: cannot get ReaderAt")
 		}
@@ -1597,7 +1608,7 @@ func ReadAtResult[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt
 		return nil, ErrNilFunc
 	}
 	return Do(ctx, func(s *Scope) (*T, error) {
-		ra, size := s.UseReaderAtWithOptions(src, opts...)
+		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
 			return nil, errors.New("fio: cannot get ReaderAt")
 		}
