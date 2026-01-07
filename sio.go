@@ -3,28 +3,28 @@
 //
 // It offers multiple API styles:
 //
-//   - One-liners: sio.Copy, sio.Transform, sio.TransformAt
-//   - Manual control: sio.OpenIn, sio.NewOut, sio.Finalize
-//   - Callback-based: sio.Process, sio.Read (guaranteed cleanup)
-//   - Binder pattern: sio.BindProcess, sio.BindRead (multiple inputs)
+//   - One-liners: Copy, Transform, TransformAt
+//   - Manual control: OpenIn, NewOut, Finalize
+//   - Callback-based: Process, Read (guaranteed cleanup)
+//   - Binder pattern: BindProcess, BindRead (multiple inputs)
 //
 // Basic usage:
 //
-//	mgr, _ := sio.NewIoManager("./temp", sio.Memory)
+//	mgr, _ := NewIoManager("./temp", Memory)
 //	defer mgr.Cleanup()
 //
 //	ses, _ := mgr.NewSession()
 //	defer ses.Cleanup()
 //
-//	ctx := sio.WithSession(context.Background(), ses)
+//	ctx := WithSession(context.Background(), ses)
 //
 //	// One-liner style
-//	out, err := sio.Transform(ctx, "./input.pdf", sio.Out(".pdf"), compressPDF)
+//	out, err := Transform(ctx, "./input.pdf", Out(".pdf"), compressPDF)
 //
 //	// Manual style
-//	in, _ := sio.OpenIn(ctx, "./input.pdf")
+//	in, _ := OpenIn(ctx, "./input.pdf")
 //	defer in.Close()
-//	oh, _ := sio.NewOut(ctx, sio.Out(".pdf"))
+//	oh, _ := NewOut(ctx, Out(".pdf"))
 //	io.Copy(oh.W, in.R)
 //	out, _ := oh.Finalize()
 package sio
@@ -185,8 +185,8 @@ func (t thresholdOption) applyOut(o *OutConfig) {
 //
 // Example:
 //
-//	manager := sio.NewIoManager("./temp", sio.Memory,
-//	    sio.WithThreshold(100*1024*1024), // 100MB threshold
+//	manager := NewIoManager("./temp", Memory,
+//	    WithThreshold(100*1024*1024), // 100MB threshold
 //	)
 //
 // It can also be used per operation via Out().
@@ -225,11 +225,11 @@ func (st StorageType) applyOut(o *OutConfig) {
 //
 // Usage:
 //
-//	sio.Out(".pdf")                        // use session default
-//	sio.Out(".pdf", sio.Memory)            // force memory storage
-//	sio.Out(".pdf", sio.File)              // force file storage
-//	sio.Out(".pdf", sio.Storage("memory")) // from string config
-//	sio.Out(".pdf", sio.WithThreshold(10)) // per-operation threshold
+//	Out(".pdf")                        // use session default
+//	Out(".pdf", Memory)            // force memory storage
+//	Out(".pdf", File)              // force file storage
+//	Out(".pdf", Storage("memory")) // from string config
+//	Out(".pdf", WithThreshold(10)) // per-operation threshold
 func Out(ext string, opts ...OutOption) OutConfig {
 	o := OutConfig{ext: ext}
 	for _, opt := range opts {
@@ -878,7 +878,7 @@ func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, 
 //
 // Example:
 //
-//	out, err := sio.Transform(ctx, "./input.pdf", sio.Out(".pdf"), func(r io.Reader, w io.Writer) error {
+//	out, err := Transform(ctx, "./input.pdf", Out(".pdf"), func(r io.Reader, w io.Writer) error {
 //	    return compress(r, w)
 //	})
 func Transform(ctx context.Context, src any, out OutConfig, fn func(r io.Reader, w io.Writer) error) (*Output, error) {
@@ -909,7 +909,7 @@ func Transform(ctx context.Context, src any, out OutConfig, fn func(r io.Reader,
 //
 // Example:
 //
-//	out, err := sio.Copy(ctx, "./input.pdf", sio.Out(".pdf"))
+//	out, err := Copy(ctx, "./input.pdf", Out(".pdf"))
 func CopyTo(ctx context.Context, src any, out OutConfig) (*Output, error) {
 	return Transform(ctx, src, out, func(r io.Reader, w io.Writer) error {
 		_, err := io.Copy(w, r)
@@ -922,7 +922,7 @@ func CopyTo(ctx context.Context, src any, out OutConfig) (*Output, error) {
 //
 // Example:
 //
-//	out, err := sio.TransformAt(ctx, "./input.pdf", sio.Out(".pdf"),
+//	out, err := TransformAt(ctx, "./input.pdf", Out(".pdf"),
 //	    func(ra io.ReaderAt, size int64, w io.Writer) error {
 //	        return pdf.Process(ra, size, w)
 //	    })
@@ -1118,8 +1118,8 @@ type manager struct {
 
 // NewIoManager creates a new IoManager.
 //
-//	mgr, _ := sio.NewIoManager("./temp", sio.Memory)
-//	mgr, _ := sio.NewIoManager("./temp", sio.File, sio.WithThreshold(100*1024*1024))
+//	mgr, _ := NewIoManager("./temp", Memory)
+//	mgr, _ := NewIoManager("./temp", File, WithThreshold(100*1024*1024))
 func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption) (IoManager, error) {
 	// Apply options
 	config := &managerConfig{
@@ -3251,3 +3251,115 @@ func SafeClose(c io.Closer) {
 	}
 	_ = c.Close()
 }
+
+// Scope owns opened inputs + (optional) one output handle.
+// Everything is auto-cleaned at the end of Do().
+type Scope struct {
+	ctx context.Context
+
+	ins []*Input
+
+	outHandle *OutHandle
+	out       *Output // finalized output (after finalize)
+}
+
+// Open opens anything that OpenIn supports:
+// string, StreamReader, *Output (via out.Reader()), io.Reader, etc.
+func (s *Scope) Open(src any) io.Reader {
+	in, err := OpenIn(s.ctx, src)
+	if err != nil {
+		// store as scope error by panicking? no. return reader that will fail.
+		// simplest: return empty reader; Do will return error if you check.
+		// We'll attach error via a sentinel reader.
+		return errReader{err: err}
+	}
+	s.ins = append(s.ins, in)
+	return in.R
+}
+
+// NewOut creates output writer managed by the scope.
+// Only one output per Do() to keep API simple/deterministic.
+func (s *Scope) NewOut(out OutConfig, sizeHint ...int64) io.Writer {
+	if s.outHandle != nil {
+		return errWriter{err: errors.New("stio: NewOut called more than once")}
+	}
+
+	oh, err := NewOut(s.ctx, out, sizeHint...)
+	if err != nil {
+		return errWriter{err: err}
+	}
+
+	s.outHandle = oh
+	return oh.W
+}
+
+// finalize output and close inputs.
+func (s *Scope) cleanupAndFinalize(fnErr error) (*Output, error) {
+	// close inputs
+	var cerr error
+	for i := len(s.ins) - 1; i >= 0; i-- {
+		if s.ins[i] != nil {
+			if err := s.ins[i].Close(); err != nil && cerr == nil {
+				cerr = err
+			}
+		}
+	}
+	s.ins = nil
+
+	// if function errored, abort output
+	if fnErr != nil {
+		if s.outHandle != nil {
+			_ = s.outHandle.Cleanup()
+			s.outHandle = nil
+		}
+		// prefer fnErr
+		return nil, fnErr
+	}
+
+	// finalize output if exists
+	if s.outHandle == nil {
+		if cerr != nil {
+			return nil, cerr
+		}
+		return nil, nil
+	}
+
+	out, err := s.outHandle.Finalize()
+	s.outHandle = nil
+	if err != nil {
+		return nil, err
+	}
+
+	// if close-input errors exist, surface them after successful finalize
+	if cerr != nil {
+		return out, cerr
+	}
+	return out, nil
+}
+
+// Do executes fn with guaranteed cleanup + optional output finalize.
+func Do[T any](ctx context.Context, fn func(s *Scope) (T, error)) (*Output, T, error) {
+	var zero T
+	if fn == nil {
+		return nil, zero, errors.New("stio: nil fn")
+	}
+
+	sc := &Scope{ctx: ctx}
+	res, err := fn(sc)
+
+	out, finErr := sc.cleanupAndFinalize(err)
+	if finErr != nil {
+		return nil, zero, finErr
+	}
+	return out, res, nil
+}
+
+/* ---------------- helpers ---------------- */
+
+type errReader struct{ err error }
+
+func (e errReader) Read(p []byte) (int, error) { return 0, e.err }
+
+type errWriter struct{ err error }
+
+func (e errWriter) Write(p []byte) (int, error) { return 0, e.err }
