@@ -24,26 +24,21 @@ import (
 /*                                  Consts                                    */
 /* -------------------------------------------------------------------------- */
 
-// Common file extensions
 const (
 	Json = ".json"
 	Csv  = ".csv"
 	Txt  = ".txt"
 	Xml  = ".xml"
-
 	Pdf  = ".pdf"
 	Docx = ".docx"
 	Xlsx = ".xlsx"
 	Pptx = ".pptx"
-
 	Jpg  = ".jpg"
 	Jpeg = ".jpeg"
 	Png  = ".png"
-
-	Zip = ".zip"
+	Zip  = ".zip"
 )
 
-// Input source kinds
 const (
 	KindFile      = "file"
 	KindURL       = "url"
@@ -53,13 +48,9 @@ const (
 	KindStream    = "stream"
 )
 
-// DefaultBaseTempDir is the default base directory for file storage.
 const DefaultBaseTempDir = "./temp"
 
-// MB converts megabytes to bytes.
-func MB(size int64) int64 { return size * 1024 * 1024 }
-
-// ToExt adds a dot prefix to a format string.
+func MB(size int64) int64        { return size * 1024 * 1024 }
 func ToExt(format string) string { return "." + format }
 
 /* -------------------------------------------------------------------------- */
@@ -68,21 +59,15 @@ func ToExt(format string) string { return "." + format }
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
-// Config holds global configuration
-type Config struct {
-	client *http.Client
-}
+type Config struct{ client *http.Client }
 
-// NewConfig constructs a Config with a custom HTTP client.
 func NewConfig(client *http.Client) Config { return Config{client: client} }
 
-// WithClient sets the HTTP client on a Config.
 func (c Config) WithClient(client *http.Client) Config {
 	c.client = client
 	return c
 }
 
-// Configure applies global configuration (call at app startup only)
 func Configure(config Config) error {
 	if config.client != nil {
 		httpClient = config.client
@@ -111,37 +96,25 @@ var (
 /*                              Storage Types                                  */
 /* -------------------------------------------------------------------------- */
 
-// StorageType defines how the IoManager stores data.
 type StorageType int
 
 const (
-	// File stores data as temporary files on disk (default).
 	File StorageType = iota
-	// Memory stores data in memory as byte slices.
 	Memory
 )
 
-// Storage converts string to StorageType.
-// Supports: "file", "memory"
 func Storage(s string) StorageType {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "memory":
+	if strings.ToLower(strings.TrimSpace(s)) == "memory" {
 		return Memory
-	default:
-		return File
 	}
+	return File
 }
 
-// String returns string representation of StorageType.
 func (s StorageType) String() string {
-	switch s {
-	case Memory:
+	if s == Memory {
 		return "memory"
-	case File:
-		return "file"
-	default:
-		return "file"
 	}
+	return "file"
 }
 
 /* -------------------------------------------------------------------------- */
@@ -152,12 +125,11 @@ func (s StorageType) String() string {
 type Input struct {
 	R       io.ReadCloser
 	Size    int64
-	Kind    string // "file" | "url" | "multipart" | "memory" | "reader" | "stream"
-	Path    string // for file/url reference
+	Kind    string
+	Path    string
 	cleanup func() error
 }
 
-// Close closes the reader and cleans up resources.
 func (in *Input) Close() error {
 	if in == nil {
 		return nil
@@ -201,25 +173,10 @@ func OpenIn(ctx context.Context, src any) (*Input, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Input{
-			R:    rc,
-			Size: v.Size(),
-			Kind: KindStream,
-			Path: v.Path(),
-			cleanup: func() error {
-				return rc.Close()
-			},
-		}, nil
+		return &Input{R: rc, Size: v.Size(), Kind: KindStream, Path: v.Path()}, nil
 
 	case string:
-		s := strings.TrimSpace(v)
-		if s == "" {
-			return nil, errors.New("fio: empty string source")
-		}
-		if isURL(s) {
-			return openURL(ctx, s)
-		}
-		return openFilePath(s)
+		return openString(ctx, v)
 
 	case *multipart.FileHeader:
 		if v == nil {
@@ -229,85 +186,42 @@ func OpenIn(ctx context.Context, src any) (*Input, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Input{
-			R:       rc,
-			Size:    v.Size,
-			Kind:    KindMultipart,
-			cleanup: nil, // rc.Close() handled by R
-		}, nil
+		return &Input{R: rc, Size: v.Size, Kind: KindMultipart}, nil
 
 	case *os.File:
 		if v == nil {
 			return nil, errors.New("fio: nil *os.File")
 		}
-		return &Input{
-			R:       v,
-			Size:    fileSize(v),
-			Kind:    KindFile,
-			Path:    v.Name(),
-			cleanup: nil, // v.Close() handled by R
-		}, nil
+		return &Input{R: v, Size: fileSize(v), Kind: KindFile, Path: v.Name()}, nil
 
 	case []byte:
-		return &Input{
-			R:       io.NopCloser(bytes.NewReader(v)),
-			Size:    int64(len(v)),
-			Kind:    KindMemory,
-			cleanup: nil,
-		}, nil
+		return &Input{R: io.NopCloser(bytes.NewReader(v)), Size: int64(len(v)), Kind: KindMemory}, nil
 
 	case io.ReadCloser:
-		return &Input{
-			R:       v,
-			Size:    SizeAny(v),
-			Kind:    KindReader,
-			cleanup: nil, // v.Close() handled by R
-		}, nil
+		return &Input{R: v, Size: SizeAny(v), Kind: KindReader}, nil
 
 	case io.Reader:
-		return &Input{
-			R:       io.NopCloser(v),
-			Size:    SizeAny(v),
-			Kind:    KindReader,
-			cleanup: nil,
-		}, nil
+		return &Input{R: io.NopCloser(v), Size: SizeAny(v), Kind: KindReader}, nil
 
 	default:
 		return nil, fmt.Errorf("fio: unsupported source type %T", src)
 	}
 }
 
-// OpenInList opens multiple sources and returns cleanup function.
-func OpenInList(ctx context.Context, srcs ...any) ([]*Input, func() error, error) {
-	if len(srcs) == 0 {
-		return nil, func() error { return nil }, nil
+func openString(ctx context.Context, s string) (*Input, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, errors.New("fio: empty string source")
 	}
-
-	ins := make([]*Input, 0, len(srcs))
-	cleanups := make([]func() error, 0, len(srcs))
-
-	for _, s := range srcs {
-		in, err := OpenIn(ctx, s)
-		if err != nil {
-			// Cleanup already opened
-			for _, c := range cleanups {
-				_ = c()
-			}
-			return nil, func() error { return nil }, err
-		}
-		ins = append(ins, in)
-		cleanups = append(cleanups, in.Close)
+	if isURL(s) {
+		return openURL(ctx, s)
 	}
-
-	return ins, JoinCleanup(cleanups...), nil
+	return openFilePath(s)
 }
 
 func isURL(s string) bool {
 	u, err := url.Parse(s)
-	if err != nil {
-		return false
-	}
-	return u.Scheme == "http" || u.Scheme == "https"
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https")
 }
 
 func fileSize(f *os.File) int64 {
@@ -326,13 +240,7 @@ func openFilePath(path string) (*Input, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Input{
-		R:       f,
-		Size:    fileSize(f),
-		Kind:    KindFile,
-		Path:    path,
-		cleanup: nil, // f.Close() handled by R
-	}, nil
+	return &Input{R: f, Size: fileSize(f), Kind: KindFile, Path: path}, nil
 }
 
 func openURL(ctx context.Context, urlStr string) (*Input, error) {
@@ -351,27 +259,94 @@ func openURL(ctx context.Context, urlStr string) (*Input, error) {
 		return nil, fmt.Errorf("%w: %s", ErrDownloadFailed, resp.Status)
 	}
 
-	return &Input{
-		R:       resp.Body,
-		Size:    resp.ContentLength,
-		Kind:    KindURL,
-		Path:    urlStr,
-		cleanup: nil, // resp.Body.Close() handled by R
-	}, nil
+	return &Input{R: resp.Body, Size: resp.ContentLength, Kind: KindURL, Path: urlStr}, nil
 }
 
-// JoinCleanup combines multiple cleanup functions into one (errors.Join).
-func JoinCleanup(fns ...func() error) func() error {
-	return func() error {
-		var errs error
-		for _, fn := range fns {
-			if fn == nil {
-				continue
-			}
-			errs = errors.Join(errs, fn())
+/* -------------------------------------------------------------------------- */
+/*                           openReader (no alloc)                             */
+/* -------------------------------------------------------------------------- */
+
+// openReader opens source and returns reader + cleanup (minimal allocation path)
+func openReader(ctx context.Context, src any) (io.ReadCloser, func() error, int64, error) {
+	switch v := src.(type) {
+	case *Input:
+		return v.R, v.Close, v.Size, nil
+
+	case *Output:
+		if v == nil {
+			return nil, nil, -1, errors.New("fio: nil *Output")
 		}
-		return errs
+		rc, err := v.OpenReader()
+		if err != nil {
+			return nil, nil, -1, err
+		}
+		return rc, rc.Close, v.Size(), nil
+
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return nil, nil, -1, errors.New("fio: empty string source")
+		}
+		if isURL(s) {
+			return openURLDirect(ctx, s)
+		}
+		return openFileDirect(s)
+
+	case *multipart.FileHeader:
+		if v == nil {
+			return nil, nil, -1, errors.New("fio: nil *multipart.FileHeader")
+		}
+		rc, err := v.Open()
+		if err != nil {
+			return nil, nil, -1, err
+		}
+		return rc, rc.Close, v.Size, nil
+
+	case *os.File:
+		if v == nil {
+			return nil, nil, -1, errors.New("fio: nil *os.File")
+		}
+		return v, v.Close, fileSize(v), nil
+
+	case []byte:
+		return io.NopCloser(bytes.NewReader(v)), nil, int64(len(v)), nil
+
+	case io.ReadCloser:
+		return v, v.Close, SizeAny(v), nil
+
+	case io.Reader:
+		return io.NopCloser(v), nil, SizeAny(v), nil
+
+	default:
+		return nil, nil, -1, fmt.Errorf("fio: unsupported source type %T", src)
 	}
+}
+
+func openFileDirect(path string) (io.ReadCloser, func() error, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, -1, err
+	}
+	return f, f.Close, fileSize(f), nil
+}
+
+func openURLDirect(ctx context.Context, urlStr string) (io.ReadCloser, func() error, int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, nil, -1, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, -1, fmt.Errorf("%w: %v", ErrDownloadFailed, err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_ = resp.Body.Close()
+		return nil, nil, -1, fmt.Errorf("%w: %s", ErrDownloadFailed, resp.Status)
+	}
+
+	return resp.Body, resp.Body.Close, resp.ContentLength, nil
 }
 
 /* -------------------------------------------------------------------------- */
@@ -386,40 +361,27 @@ type OutHandle struct {
 	done    bool
 }
 
-// Finalize closes the writer and returns the Output (idempotent).
 func (h *OutHandle) Finalize() (*Output, error) {
 	if h == nil {
 		return nil, errors.New("fio: nil OutHandle")
 	}
 	if h.done {
-		if h.output == nil {
-			return nil, errors.New("fio: nil output")
-		}
 		return h.output, nil
 	}
 	h.done = true
 
-	if h.output == nil {
-		if h.W != nil {
-			_ = h.W.Close()
-			h.W = nil
-		}
-		return nil, errors.New("fio: nil output")
-	}
-
 	if h.W != nil {
 		if err := h.W.Close(); err != nil {
-			_ = h.output.cleanup()
-			h.W = nil
+			if h.output != nil {
+				_ = h.output.cleanup()
+			}
 			return nil, err
 		}
-		h.W = nil
 	}
 
 	return h.output, nil
 }
 
-// Cleanup aborts the output (use if error occurs before Finalize).
 func (h *OutHandle) Cleanup() error {
 	if h == nil || h.done {
 		return nil
@@ -429,7 +391,6 @@ func (h *OutHandle) Cleanup() error {
 	var errs error
 	if h.W != nil {
 		errs = errors.Join(errs, h.W.Close())
-		h.W = nil
 	}
 	if h.output != nil {
 		errs = errors.Join(errs, h.output.cleanup())
@@ -437,7 +398,6 @@ func (h *OutHandle) Cleanup() error {
 	return errs
 }
 
-// Output returns the underlying Output (may be nil).
 func (h *OutHandle) Output() *Output {
 	if h == nil {
 		return nil
@@ -446,7 +406,6 @@ func (h *OutHandle) Output() *Output {
 }
 
 // NewOut creates an output handle for manual writing.
-// Requires session in context.
 func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, error) {
 	ses := Session(ctx)
 	if ses == nil {
@@ -462,7 +421,6 @@ func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, 
 		return nil, err
 	}
 
-	// Determine storage type
 	var hint int64 = -1
 	if len(sizeHint) > 0 {
 		hint = sizeHint[0]
@@ -488,18 +446,13 @@ func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, 
 		return nil, err
 	}
 
-	return &OutHandle{
-		W:       w,
-		output:  output,
-		session: iSes,
-	}, nil
+	return &OutHandle{W: w, output: output, session: iSes}, nil
 }
 
 /* -------------------------------------------------------------------------- */
 /*                                   Output                                    */
 /* -------------------------------------------------------------------------- */
 
-// Output represents a file or memory buffer produced by processing.
 type Output struct {
 	mu          sync.Mutex
 	path        string
@@ -516,7 +469,6 @@ func (o *Output) Path() string {
 	return o.path
 }
 
-// StorageType returns the storage type of this output.
 func (o *Output) StorageType() StorageType {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -530,11 +482,9 @@ func (o *Output) Size() int64 {
 	if o.closed {
 		return -1
 	}
-
 	if o.storageType == Memory {
 		return int64(len(o.data))
 	}
-
 	fi, err := os.Stat(o.path)
 	if err != nil {
 		return -1
@@ -547,50 +497,37 @@ func (o *Output) OpenReader() (io.ReadCloser, error) {
 	defer o.mu.Unlock()
 
 	if o.closed {
-		return nil, fmt.Errorf("fio: output is cleaned up")
+		return nil, errors.New("fio: output is cleaned up")
 	}
 
-	// Memory mode
 	if o.storageType == Memory {
-		if o.data == nil {
-			return NopCloser(bytes.NewReader(nil)), nil
-		}
-		return NopCloser(bytes.NewReader(o.data)), nil
+		return io.NopCloser(bytes.NewReader(o.data)), nil
 	}
-
-	// File mode
 	return os.Open(o.path)
 }
 
-// OpenWriter opens writer. For Memory mode, it can pre-grow buffer based on hint (optional).
 func (o *Output) OpenWriter(sizeHint ...int64) (io.WriteCloser, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	if o.closed {
-		return nil, fmt.Errorf("fio: output is cleaned up")
+		return nil, errors.New("fio: output is cleaned up")
 	}
 
 	if o.storageType == Memory {
 		buf := &bytes.Buffer{}
 		if len(sizeHint) > 0 && sizeHint[0] > 0 {
-			// conservative cap to avoid huge alloc explosions
-			const capGrow = int64(64 << 20) // 64MB
 			n := sizeHint[0]
-			if n > capGrow {
-				n = capGrow
+			if n > 64<<20 { // cap at 64MB
+				n = 64 << 20
 			}
 			buf.Grow(int(n))
 		}
 		return &bytesWriteCloser{buf: buf, output: o}, nil
 	}
-
 	return os.Create(o.path)
 }
 
-// Data returns the raw bytes for Memory mode.
-// Returns nil for File mode.
-// The returned slice is owned by Output - do not modify.
 func (o *Output) Data() []byte {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -600,7 +537,6 @@ func (o *Output) Data() []byte {
 	return nil
 }
 
-// cleanup removes the output file or clears memory.
 func (o *Output) cleanup() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -622,7 +558,6 @@ func (o *Output) cleanup() error {
 	return err
 }
 
-// Keep marks the output file as persistent (survives session cleanup).
 func (o *Output) Keep() *Output {
 	o.mu.Lock()
 	if o.storageType == File {
@@ -632,26 +567,21 @@ func (o *Output) Keep() *Output {
 	return o
 }
 
-// SaveAs copies the output to a persistent path outside of the session dir.
 func (o *Output) SaveAs(path string) error {
 	r, err := o.OpenReader()
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-
-	_, err = copyToFile(r, path)
-	return err
+	return copyToFile(r, path)
 }
 
-// Bytes loads the entire output into memory (careful for very large files).
 func (o *Output) Bytes() ([]byte, error) {
 	r, err := o.OpenReader()
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-
 	return io.ReadAll(r)
 }
 
@@ -665,163 +595,208 @@ func (o *Output) WriteTo(w io.Writer) (int64, error) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                          Scope + Do (One-liner)                             */
+/*                          Scope (Optimized)                                  */
 /* -------------------------------------------------------------------------- */
 
-// Scope owns opened inputs + (optional) one output handle.
-// Everything is auto-cleaned at the end of Do().
+// Scope tracks opened resources for automatic cleanup.
+// Optimized: stores only cleanup functions, not full Input structs.
 type Scope struct {
-	ctx context.Context
-
-	ins []*Input
-
+	ctx       context.Context
+	cleanups  []func() error // cleanup functions (no *Input allocation)
 	outHandle *OutHandle
-	out       *Output // finalized output (after finalize)
 	err       error
 }
 
-// Open opens anything that OpenIn supports.
-// If it fails, Do() will return the accumulated error.
+// Open opens source and returns reader. Cleanup is automatic.
 func (s *Scope) Open(src any) io.Reader {
-	in, err := OpenIn(s.ctx, src)
+	rc, cleanup, _, err := openReader(s.ctx, src)
 	if err != nil {
 		s.err = errors.Join(s.err, err)
-		return errReader{err: err}
+		return errReader{err}
 	}
-	s.ins = append(s.ins, in)
-	return in.R
+	if cleanup != nil {
+		s.cleanups = append(s.cleanups, cleanup)
+	}
+	return rc
 }
 
-// NewOut creates output writer managed by the scope.
-// Only one output per Do() to keep API simple/deterministic.
+// OpenSized opens source and returns reader + size.
+func (s *Scope) OpenSized(src any) (io.Reader, int64) {
+	rc, cleanup, size, err := openReader(s.ctx, src)
+	if err != nil {
+		s.err = errors.Join(s.err, err)
+		return errReader{err}, -1
+	}
+	if cleanup != nil {
+		s.cleanups = append(s.cleanups, cleanup)
+	}
+	return rc, size
+}
+
+// NewOut creates output writer.
 func (s *Scope) NewOut(out OutConfig, sizeHint ...int64) io.Writer {
 	if s.outHandle != nil {
 		err := errors.New("fio: NewOut called more than once")
 		s.err = errors.Join(s.err, err)
-		return errWriter{err: err}
+		return errWriter{err}
 	}
 
 	oh, err := NewOut(s.ctx, out, sizeHint...)
 	if err != nil {
 		s.err = errors.Join(s.err, err)
-		return errWriter{err: err}
+		return errWriter{err}
 	}
 
 	s.outHandle = oh
 	return oh.W
 }
 
-// finalize output and close inputs.
-func (s *Scope) cleanupAndFinalize(fnErr error) (*Output, error) {
+// Err returns accumulated error.
+func (s *Scope) Err() error { return s.err }
+
+func (s *Scope) cleanup() {
+	// Cleanup in reverse order
+	for i := len(s.cleanups) - 1; i >= 0; i-- {
+		if s.cleanups[i] != nil {
+			_ = s.cleanups[i]()
+		}
+	}
+	s.cleanups = nil
+}
+
+func (s *Scope) finalize(fnErr error) (*Output, error) {
 	if s.err != nil {
 		fnErr = errors.Join(fnErr, s.err)
 	}
 
-	// close inputs
-	var cerr error
-	for i := len(s.ins) - 1; i >= 0; i-- {
-		if s.ins[i] != nil {
-			if err := s.ins[i].Close(); err != nil {
-				cerr = errors.Join(cerr, err)
-			}
-		}
-	}
-	s.ins = nil
+	// Cleanup inputs
+	s.cleanup()
 
-	// if function errored, abort output
+	// If error, abort output
 	if fnErr != nil {
 		if s.outHandle != nil {
 			_ = s.outHandle.Cleanup()
-			s.outHandle = nil
 		}
 		return nil, fnErr
 	}
 
-	// finalize output if exists
+	// Finalize output
 	if s.outHandle == nil {
-		if cerr != nil {
-			return nil, cerr
-		}
 		return nil, nil
 	}
 
-	out, err := s.outHandle.Finalize()
-	s.outHandle = nil
-	if err != nil {
-		return nil, err
-	}
-
-	if cerr != nil {
-		return out, cerr
-	}
-	return out, nil
+	return s.outHandle.Finalize()
 }
 
-// Do executes fn with guaranteed cleanup + optional output finalize.
+/* -------------------------------------------------------------------------- */
+/*                              Do (Generic)                                   */
+/* -------------------------------------------------------------------------- */
+
+// Do executes fn with automatic cleanup and optional output.
 func Do[T any](ctx context.Context, fn func(s *Scope) (T, error)) (*Output, T, error) {
 	var zero T
 	if fn == nil {
-		return nil, zero, errors.New("fio: nil fn")
+		return nil, zero, ErrNilFunc
 	}
 
-	sc := &Scope{ctx: ctx}
-	res, err := fn(sc)
+	// Direct allocation - no pool needed (compiler may stack-allocate)
+	s := &Scope{
+		ctx:      ctx,
+		cleanups: make([]func() error, 0, 4), // pre-alloc for common case
+	}
 
-	out, finErr := sc.cleanupAndFinalize(err)
+	res, err := fn(s)
+	out, finErr := s.finalize(err)
+
 	if finErr != nil {
 		return nil, zero, finErr
 	}
 	return out, res, nil
 }
 
-/* ---------------- helpers ---------------- */
+/* -------------------------------------------------------------------------- */
+/*                           One-liner Helpers                                 */
+/* -------------------------------------------------------------------------- */
 
-type errReader struct{ err error }
+// Copy copies src to output.
+func Copy(ctx context.Context, src any, out OutConfig) (*Output, error) {
+	o, _, err := Do(ctx, func(s *Scope) (struct{}, error) {
+		r, size := s.OpenSized(src)
+		w := s.NewOut(out, size)
+		_, err := io.Copy(w, r)
+		return struct{}{}, err
+	})
+	return o, err
+}
 
-func (e errReader) Read(p []byte) (int, error) { return 0, e.err }
+// Transform applies fn to src and writes to output.
+func Transform(ctx context.Context, src any, out OutConfig, fn func(r io.Reader, w io.Writer) error) (*Output, error) {
+	if fn == nil {
+		return nil, ErrNilFunc
+	}
+	o, _, err := Do(ctx, func(s *Scope) (struct{}, error) {
+		r, size := s.OpenSized(src)
+		w := s.NewOut(out, size)
+		return struct{}{}, fn(r, w)
+	})
+	return o, err
+}
 
-type errWriter struct{ err error }
+// TransformResult applies fn and returns result.
+func TransformResult[T any](ctx context.Context, src any, out OutConfig, fn func(r io.Reader, w io.Writer) (T, error)) (*Output, T, error) {
+	if fn == nil {
+		var zero T
+		return nil, zero, ErrNilFunc
+	}
+	return Do(ctx, func(s *Scope) (T, error) {
+		r, size := s.OpenSized(src)
+		w := s.NewOut(out, size)
+		return fn(r, w)
+	})
+}
 
-func (e errWriter) Write(p []byte) (int, error) { return 0, e.err }
+// Consume reads src without creating output.
+func Consume[T any](ctx context.Context, src any, fn func(r io.Reader) (T, error)) (T, error) {
+	if fn == nil {
+		var zero T
+		return zero, ErrNilFunc
+	}
+	_, res, err := Do(ctx, func(s *Scope) (T, error) {
+		r := s.Open(src)
+		return fn(r)
+	})
+	return res, err
+}
 
 /* -------------------------------------------------------------------------- */
 /*                                   Size                                     */
 /* -------------------------------------------------------------------------- */
 
-// SizeAny tries to determine size of common stream/file types.
-// Returns -1 if size cannot be determined.
 func SizeAny(x any) int64 {
 	if x == nil {
 		return -1
 	}
 
-	// 1) explicit: multipart.FileHeader has Size field
-	if fh, ok := x.(*multipart.FileHeader); ok {
-		if fh.Size >= 0 {
-			return fh.Size
-		}
+	if fh, ok := x.(*multipart.FileHeader); ok && fh.Size >= 0 {
+		return fh.Size
 	}
 
-	// 2) Size() int64 (your own types)
 	if sr, ok := x.(interface{ Size() int64 }); ok {
 		if n := sr.Size(); n >= 0 {
 			return n
 		}
 	}
 
-	// 3) Len() int (buffers)
 	if lr, ok := x.(interface{ Len() int }); ok {
 		return int64(lr.Len())
 	}
 
-	// 4) os.File (stat)
 	if f, ok := x.(*os.File); ok {
 		if fi, err := f.Stat(); err == nil {
 			return fi.Size()
 		}
 	}
 
-	// 5) io.Seeker / io.ReadSeeker (seek end then restore)
 	if seeker, ok := x.(io.Seeker); ok {
 		cur, err := seeker.Seek(0, io.SeekCurrent)
 		if err != nil {
@@ -832,16 +807,12 @@ func SizeAny(x any) int64 {
 			_, _ = seeker.Seek(cur, io.SeekStart)
 			return -1
 		}
-		if _, err := seeker.Seek(cur, io.SeekStart); err != nil {
-			return -1
-		}
+		_, _ = seeker.Seek(cur, io.SeekStart)
 		return end
 	}
 
 	return -1
 }
-
-func SizeFromReader(r io.Reader) int64 { return SizeAny(r) }
 
 func SizeFromPath(path string) (int64, error) {
 	fi, err := os.Stat(path)
@@ -859,13 +830,10 @@ type ctxKey struct{}
 
 var sessionKey = ctxKey{}
 
-// WithSession attaches a IoSession into context.
 func WithSession(ctx context.Context, ses IoSession) context.Context {
 	return context.WithValue(ctx, sessionKey, ses)
 }
 
-// Session extracts IoSession from context.
-// Returns nil if not found.
 func Session(ctx context.Context) IoSession {
 	ses, _ := ctx.Value(sessionKey).(IoSession)
 	return ses
@@ -875,25 +843,21 @@ func Session(ctx context.Context) IoSession {
 /*                                 IoSession                                   */
 /* -------------------------------------------------------------------------- */
 
-// IoSession manages temporary files for a single job/request.
 type IoSession interface {
 	Cleanup() error
 }
 
-// ioSession represents an isolated working directory where all temporary files
-// and transformation outputs are stored during a single job or request.
 type ioSession struct {
 	mu            sync.Mutex
 	manager       IoManager
 	dir           string
 	closed        bool
-	outputs       []*Output // tracked outputs inside this session
+	outputs       []*Output
 	cleanupFns    []func() error
 	storageType   StorageType
-	autoThreshold int64 // 0 = disabled, >0 = auto storage switching threshold
+	autoThreshold int64
 }
 
-// Dir returns the directory assigned to this IoSession.
 func (s *ioSession) Dir() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -909,7 +873,6 @@ func (s *ioSession) ensureOpen() error {
 	return nil
 }
 
-// newOutputWithStorage creates output with specified storage type.
 func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*Output, error) {
 	if err := s.ensureOpen(); err != nil {
 		return nil, err
@@ -918,24 +881,16 @@ func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Memory mode
 	if storageType == Memory {
-		out := &Output{
-			path:        "",
-			ses:         s,
-			data:        nil,
-			storageType: Memory,
-		}
+		out := &Output{ses: s, storageType: Memory}
 		s.outputs = append(s.outputs, out)
 		return out, nil
 	}
 
-	// File requires directory
 	if s.dir == "" {
 		return nil, ErrFileStorageUnavailable
 	}
 
-	// File mode: create temp file
 	pattern := "*"
 	if ext != "" {
 		pattern += ext
@@ -947,11 +902,7 @@ func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*
 	}
 	_ = f.Close()
 
-	out := &Output{
-		path:        f.Name(),
-		ses:         s,
-		storageType: File,
-	}
+	out := &Output{path: f.Name(), ses: s, storageType: File}
 	s.outputs = append(s.outputs, out)
 	return out, nil
 }
@@ -981,19 +932,18 @@ func (s *ioSession) Cleanup() error {
 
 	for _, out := range s.outputs {
 		out.mu.Lock()
-		shouldSkip := out.keep && !out.closed && out.storageType == File
+		skip := out.keep && !out.closed && out.storageType == File
 		out.mu.Unlock()
-		if shouldSkip {
+		if skip {
 			continue
 		}
 		errs = errors.Join(errs, out.cleanup())
 	}
 
 	for _, fn := range s.cleanupFns {
-		if fn == nil {
-			continue
+		if fn != nil {
+			errs = errors.Join(errs, fn())
 		}
-		errs = errors.Join(errs, fn())
 	}
 	s.cleanupFns = nil
 
@@ -1003,8 +953,7 @@ func (s *ioSession) Cleanup() error {
 
 	entries, err := os.ReadDir(s.dir)
 	if err != nil && !os.IsNotExist(err) {
-		errs = errors.Join(errs, err)
-		return errs
+		return errors.Join(errs, err)
 	}
 
 	for _, e := range entries {
@@ -1023,36 +972,20 @@ func (s *ioSession) Cleanup() error {
 	return errs
 }
 
-func (s *ioSession) addCleanup(fn func() error) {
-	if s == nil || fn == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		_ = fn()
-		return
-	}
-	s.cleanupFns = append(s.cleanupFns, fn)
-}
-
 /* -------------------------------------------------------------------------- */
 /*                            Manager Options                                  */
 /* -------------------------------------------------------------------------- */
 
-// ManagerOption is a functional option for configuring IoManager.
 type ManagerOption interface {
 	applyManager(*managerConfig)
 }
 
-// ManagerOptionFunc adapts a function to ManagerOption.
 type ManagerOptionFunc func(*managerConfig)
 
 func (f ManagerOptionFunc) applyManager(c *managerConfig) { f(c) }
 
-// managerConfig holds configuration for IoManager.
 type managerConfig struct {
-	autoThreshold int64 // 0 = disabled, >0 = threshold in bytes for auto storage switching
+	autoThreshold int64
 }
 
 type thresholdOption int64
@@ -1063,20 +996,17 @@ func (t thresholdOption) applyOut(o *OutConfig) {
 	o.autoThreshold = &val
 }
 
-// WithThreshold sets the automatic storage threshold.
 func WithThreshold(bytes int64) thresholdOption { return thresholdOption(bytes) }
 
 /* -------------------------------------------------------------------------- */
 /*                                  Manager                                    */
 /* -------------------------------------------------------------------------- */
 
-// IoManager manages sessions and their temporary directories.
 type IoManager interface {
 	NewSession() (IoSession, error)
 	Cleanup() error
 }
 
-// manager manages a root directory under which multiple IoSessions create their own dirs.
 type manager struct {
 	mu            sync.Mutex
 	baseDir       string
@@ -1086,7 +1016,7 @@ type manager struct {
 }
 
 func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption) (IoManager, error) {
-	config := &managerConfig{autoThreshold: 0}
+	config := &managerConfig{}
 	for _, opt := range opts {
 		if opt != nil {
 			opt.applyManager(config)
@@ -1098,11 +1028,7 @@ func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption
 		if err != nil {
 			return nil, err
 		}
-		return &manager{
-			baseDir:       dir,
-			storageType:   storageType,
-			autoThreshold: config.autoThreshold,
-		}, nil
+		return &manager{baseDir: dir, storageType: storageType, autoThreshold: config.autoThreshold}, nil
 	}
 
 	baseDir = filepath.Clean(baseDir)
@@ -1110,11 +1036,7 @@ func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption
 		return nil, err
 	}
 
-	return &manager{
-		baseDir:       baseDir,
-		storageType:   storageType,
-		autoThreshold: config.autoThreshold,
-	}, nil
+	return &manager{baseDir: baseDir, storageType: storageType, autoThreshold: config.autoThreshold}, nil
 }
 
 func (m *manager) NewSession() (IoSession, error) {
@@ -1163,26 +1085,21 @@ func (m *manager) Cleanup() error {
 /*                              Output Options                                 */
 /* -------------------------------------------------------------------------- */
 
-// OutConfig configures output behavior.
 type OutConfig struct {
 	ext           string
 	storageType   *StorageType
 	autoThreshold *int64
 }
 
-// OutOption configures output behavior.
 type OutOption interface {
 	applyOut(*OutConfig)
 }
 
-// OutOptionFunc adapts a function to OutOption.
 type OutOptionFunc func(*OutConfig)
 
 func (f OutOptionFunc) applyOut(o *OutConfig) { f(o) }
+func (st StorageType) applyOut(o *OutConfig)  { o.storageType = &st }
 
-func (st StorageType) applyOut(o *OutConfig) { o.storageType = &st }
-
-// Out creates output configuration.
 func Out(ext string, opts ...OutOption) OutConfig {
 	o := OutConfig{ext: ext}
 	for _, opt := range opts {
@@ -1193,16 +1110,9 @@ func Out(ext string, opts ...OutOption) OutConfig {
 	return o
 }
 
-func (o OutConfig) getStorageType(sessionDefault StorageType) StorageType {
-	if o.storageType != nil {
-		return *o.storageType
-	}
-	return sessionDefault
-}
-
-func (o OutConfig) Ext() string               { return o.ext }
-func (o OutConfig) StorageType() *StorageType { return o.storageType }
-func (o OutConfig) AutoThreshold() *int64     { return o.autoThreshold }
+func (o OutConfig) Ext() string                  { return o.ext }
+func (o OutConfig) StorageTypeVal() *StorageType { return o.storageType }
+func (o OutConfig) AutoThreshold() *int64        { return o.autoThreshold }
 
 /* -------------------------------------------------------------------------- */
 /*                           bytesWriteCloser                                  */
@@ -1225,56 +1135,46 @@ func (b *bytesWriteCloser) Close() error {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                               NopCloser                                     */
+/*                                  Helpers                                    */
 /* -------------------------------------------------------------------------- */
 
-type readerAtReader struct {
-	io.Reader
-	io.ReaderAt
-}
+type errReader struct{ err error }
 
-type readerAtReadCloser struct{ *readerAtReader }
+func (e errReader) Read(p []byte) (int, error) { return 0, e.err }
 
-func (r readerAtReadCloser) Close() error { return nil }
+type errWriter struct{ err error }
 
-// NopCloser wraps an io.Reader as io.ReadCloser, preserving ReaderAt if present.
-func NopCloser(r io.Reader) io.ReadCloser {
-	if r == nil {
-		return nil
-	}
-	if rc, ok := r.(io.ReadCloser); ok {
-		return rc
-	}
-	if rc, ok := r.(readerAtReadCloser); ok {
-		return rc
-	}
-	if ra, ok := r.(io.ReaderAt); ok {
-		return readerAtReadCloser{
-			&readerAtReader{
-				Reader:   r,
-				ReaderAt: ra,
-			},
-		}
-	}
-	return io.NopCloser(r)
-}
+func (e errWriter) Write(p []byte) (int, error) { return 0, e.err }
 
-/* -------------------------------------------------------------------------- */
-/*                                   Copy                                     */
-/* -------------------------------------------------------------------------- */
-
-func Copy(dst io.Writer, src io.Reader) (int64, error) { return io.Copy(dst, src) }
-
-func copyToFile(src io.Reader, dstPath string) (int64, error) {
+func copyToFile(src io.Reader, dstPath string) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-		return 0, err
+		return err
 	}
-
 	f, err := os.Create(dstPath)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer f.Close()
+	_, err = io.Copy(f, src)
+	return err
+}
 
-	return Copy(f, src)
+// JoinCleanup combines multiple cleanup functions.
+func JoinCleanup(fns ...func() error) func() error {
+	return func() error {
+		var errs error
+		for _, fn := range fns {
+			if fn != nil {
+				errs = errors.Join(errs, fn())
+			}
+		}
+		return errs
+	}
+}
+
+// SafeClose closes c ignoring errors.
+func SafeClose(c io.Closer) {
+	if c != nil {
+		_ = c.Close()
+	}
 }
