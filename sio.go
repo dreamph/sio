@@ -775,7 +775,8 @@ func (s *ioSession) Process(ctx context.Context, source StreamReader, out OutCon
 		return nil, err
 	}
 
-	w, err := output.OpenWriter()
+	sizeHint := SizeAny(source)
+	w, err := output.OpenWriter(sizeHint)
 	if err != nil {
 		_ = output.cleanup()
 		return nil, err
@@ -818,7 +819,8 @@ func (s *ioSession) ProcessList(ctx context.Context, sources []StreamReader, out
 		return nil, err
 	}
 
-	w, err := output.OpenWriter()
+	sizeHint := SizeFromStreamList(sources)
+	w, err := output.OpenWriter(sizeHint)
 	if err != nil {
 		_ = output.cleanup()
 		return nil, err
@@ -1019,16 +1021,34 @@ func (s *ioSession) spillOutputToFile(out *Output, ext string) error {
 
 // bytesWriteCloser wraps a bytes.Buffer to implement io.WriteCloser
 type bytesWriteCloser struct {
-	buf    *bytes.Buffer
-	output *Output
+	buf             *bytes.Buffer
+	output          *Output
+	written         bool
+	preallocateData []byte // backing slice for pre-allocated buffer
 }
 
 func (b *bytesWriteCloser) Write(p []byte) (int, error) {
+	// Fast path: detect single large write (>= 64KB)
+	if !b.written && b.buf.Len() == 0 && len(p) >= 64<<10 {
+		b.written = true
+		var data []byte
+		if b.preallocateData != nil && len(p) <= cap(b.preallocateData) {
+			data = b.preallocateData[:len(p)]
+		} else {
+			data = make([]byte, len(p))
+		}
+		copy(data, p)
+		b.output.mu.Lock()
+		b.output.data = data
+		b.output.mu.Unlock()
+		return len(p), nil
+	}
+	b.written = true
 	return b.buf.Write(p)
 }
 
 func (b *bytesWriteCloser) Close() error {
-	if b.output != nil {
+	if b.output != nil && b.output.data == nil {
 		b.output.mu.Lock()
 		b.output.data = b.buf.Bytes()
 		b.output.mu.Unlock()
@@ -1142,7 +1162,7 @@ func (o *Output) OpenReader() (io.ReadCloser, error) {
 	return os.Open(o.path)
 }
 
-func (o *Output) OpenWriter() (io.WriteCloser, error) {
+func (o *Output) OpenWriter(sizeHint ...int64) (io.WriteCloser, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -1151,9 +1171,18 @@ func (o *Output) OpenWriter() (io.WriteCloser, error) {
 	}
 
 	if o.storageType == Memory {
+		var buf *bytes.Buffer
+		var preallocateData []byte
+		if len(sizeHint) > 0 && sizeHint[0] > 0 {
+			preallocateData = make([]byte, 0, int(sizeHint[0]))
+			buf = bytes.NewBuffer(preallocateData)
+		} else {
+			buf = &bytes.Buffer{}
+		}
 		return &bytesWriteCloser{
-			buf:    &bytes.Buffer{},
-			output: o,
+			buf:             buf,
+			output:          o,
+			preallocateData: preallocateData,
 		}, nil
 	}
 
@@ -1806,7 +1835,50 @@ func ProcessListResult[T any](ctx context.Context, sources []StreamReader, out O
 	return output, result, nil
 }
 
+// tryBytesFastPath attempts direct copy for BytesReader → Memory without io.Copy overhead.
+// Returns (output, true) if fast path was used, (nil, false) otherwise.
+func tryBytesFastPath(ctx context.Context, src StreamReader, out OutConfig) (*Output, bool) {
+	br, ok := src.(*BytesReader)
+	if !ok {
+		return nil, false
+	}
+
+	ses := Session(ctx)
+	if ses == nil {
+		return nil, false
+	}
+
+	iSes, ok := ses.(*ioSession)
+	if !ok {
+		return nil, false
+	}
+
+	storageType := iSes.decideStorageType(src, out)
+	if storageType != Memory || iSes.ensureOpen() != nil {
+		return nil, false
+	}
+
+	output, err := iSes.newOutputWithStorage(out.ext, Memory)
+	if err != nil || len(br.Data()) == 0 {
+		return nil, false
+	}
+
+	// Direct copy without io.Copy
+	data := make([]byte, len(br.Data()))
+	copy(data, br.Data())
+	output.mu.Lock()
+	output.data = data
+	output.mu.Unlock()
+
+	return output, true
+}
+
 func ToOutput(ctx context.Context, src StreamReader, out OutConfig) (*Output, error) {
+	// Try fast path for BytesReader → Memory
+	if output, ok := tryBytesFastPath(ctx, src, out); ok {
+		return output, nil
+	}
+
 	return Process(ctx, src, out, func(ctx context.Context, r io.Reader, w io.Writer) error {
 		_, err := Copy(w, r)
 		return err
