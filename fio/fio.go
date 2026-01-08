@@ -16,8 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 /* -------------------------------------------------------------------------- */
@@ -732,25 +730,28 @@ func (s *ioSession) isKeptPath(path string) bool {
 
 func (s *ioSession) Cleanup() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	s.mu.Unlock()
 
 	var errs error
 
+	// 1. Identify files to keep and cleanup memory/non-kept outputs
+	keepMap := make(map[string]struct{})
 	for _, out := range s.outputs {
 		out.mu.Lock()
-		skip := out.keep && !out.closed && out.storageType == File
-		out.mu.Unlock()
-		if skip {
-			continue
+		if out.storageType == File && out.keep && !out.closed {
+			keepMap[filepath.Clean(out.path)] = struct{}{}
+		} else {
+			errs = errors.Join(errs, out.cleanup())
 		}
-		errs = errors.Join(errs, out.cleanup())
+		out.mu.Unlock()
 	}
 
+	// 2. Run other cleanup functions
 	for _, fn := range s.cleanupFns {
 		if fn != nil {
 			errs = errors.Join(errs, fn())
@@ -762,24 +763,40 @@ func (s *ioSession) Cleanup() error {
 		return errs
 	}
 
+	// --- OPTIMIZATION POINT ---
+	// 3. Check if we can do a "Bulk Delete"
+	if len(keepMap) == 0 {
+		// If nothing to keep, nuke the entire directory in one go.
+		// This is significantly faster than reading directory entries.
+		if err := os.RemoveAll(s.dir); err != nil && !os.IsNotExist(err) {
+			errs = errors.Join(errs, err)
+		}
+		return errs
+	}
+
+	// 4. Selective Delete (Only if there are files to keep)
 	entries, err := os.ReadDir(s.dir)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errs
+		}
 		return errors.Join(errs, err)
 	}
 
 	for _, e := range entries {
-		full := filepath.Join(s.dir, e.Name())
-		if s.isKeptPath(full) {
-			continue
-		}
-		if err := os.RemoveAll(full); err != nil && !os.IsNotExist(err) {
-			errs = errors.Join(errs, err)
+		fullPath := filepath.Clean(filepath.Join(s.dir, e.Name()))
+
+		// Check map in O(1) time
+		if _, shouldKeep := keepMap[fullPath]; !shouldKeep {
+			if err := os.RemoveAll(fullPath); err != nil && !os.IsNotExist(err) {
+				errs = errors.Join(errs, err)
+			}
 		}
 	}
 
-	if err := os.Remove(s.dir); err != nil && !os.IsNotExist(err) {
-		errs = errors.Join(errs, err)
-	}
+	// Attempt to remove the session dir.
+	// It will only succeed if all entries inside were deleted.
+	_ = os.Remove(s.dir)
 
 	return errs
 }
@@ -852,9 +869,8 @@ func (m *manager) NewSession() (IoSession, error) {
 		return nil, ErrIoManagerClosed
 	}
 
-	id := uuid.New().String()
-	dir := filepath.Join(m.baseDir, id)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir, err := os.MkdirTemp(m.baseDir, "fio-")
+	if err != nil {
 		return nil, err
 	}
 
@@ -1209,7 +1225,57 @@ func (s *Scope) finalize(fnErr error) error {
 
 type OutScope struct {
 	Scope
-	outHandle *OutHandle
+	outHandle      *OutHandle
+	outConfig      OutConfig
+	outSizeHint    int64
+	outSizeHintSet bool
+}
+
+func (s *OutScope) setOutSizeHint(size int64) {
+	if size >= 0 && !s.outSizeHintSet {
+		s.outSizeHint = size
+		s.outSizeHintSet = true
+	}
+}
+
+// UseSized opens a Source and records size for output decisions.
+func (s *OutScope) UseSized(src Source) (io.Reader, int64) {
+	r, size := s.Scope.UseSized(src)
+	s.setOutSizeHint(size)
+	return r, size
+}
+
+// UseReaderAt opens a Source as ReaderAt and records size for output decisions.
+func (s *OutScope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64) {
+	ra, size := s.Scope.UseReaderAt(src, opts...)
+	s.setOutSizeHint(size)
+	return ra, size
+}
+
+type lazyOutWriter struct {
+	scope  *OutScope
+	writer io.Writer
+}
+
+func (w *lazyOutWriter) Write(p []byte) (int, error) {
+	if w.scope == nil {
+		return 0, errors.New("fio: nil out-scope")
+	}
+	if w.writer == nil {
+		w.writer = w.scope.ensureOutWriter()
+	}
+	return w.writer.Write(p)
+}
+
+func (s *OutScope) ensureOutWriter() io.Writer {
+	if s.outHandle != nil {
+		return s.outHandle.W
+	}
+	hint := int64(-1)
+	if s.outSizeHintSet {
+		hint = s.outSizeHint
+	}
+	return s.NewOut(s.outConfig, hint)
 }
 
 // NewOut creates output writer (only available in OutScope).
@@ -1459,7 +1525,7 @@ func Do[T any](ctx context.Context, fn func(s *Scope) (T, error)) (T, error) {
 }
 
 // DoOut: returns *Output only (output-capable scope)
-func DoOut(ctx context.Context, fn func(s *OutScope) error) (*Output, error) {
+func DoOut(ctx context.Context, outCfg OutConfig, fn func(ctx context.Context, s *OutScope, w io.Writer) error) (*Output, error) {
 	if fn == nil {
 		return nil, ErrNilFunc
 	}
@@ -1469,9 +1535,11 @@ func DoOut(ctx context.Context, fn func(s *OutScope) error) (*Output, error) {
 			ctx: ctx,
 			// cleanups: nil - lazy allocate only when needed
 		},
+		outConfig: outCfg,
 	}
 
-	err := fn(s)
+	w := &lazyOutWriter{scope: s}
+	err := fn(ctx, s, w)
 	out, finErr := s.finalizeOut(err)
 	if finErr != nil {
 		return nil, finErr
@@ -1480,7 +1548,7 @@ func DoOut(ctx context.Context, fn func(s *OutScope) error) (*Output, error) {
 }
 
 // DoOutResult: returns *Output + T (output-capable scope)
-func DoOutResult[T any](ctx context.Context, fn func(s *OutScope) (T, error)) (*Output, T, error) {
+func DoOutResult[T any](ctx context.Context, outCfg OutConfig, fn func(ctx context.Context, s *OutScope, w io.Writer) (T, error)) (*Output, T, error) {
 	var zero T
 	if fn == nil {
 		return nil, zero, ErrNilFunc
@@ -1491,9 +1559,11 @@ func DoOutResult[T any](ctx context.Context, fn func(s *OutScope) (T, error)) (*
 			ctx: ctx,
 			// cleanups: nil - lazy allocate only when needed
 		},
+		outConfig: outCfg,
 	}
 
-	res, err := fn(s)
+	w := &lazyOutWriter{scope: s}
+	res, err := fn(ctx, s, w)
 	out, finErr := s.finalizeOut(err)
 	if finErr != nil {
 		return nil, zero, finErr
@@ -1526,9 +1596,8 @@ func Copy(ctx context.Context, src Source, out OutConfig) (*Output, error) {
 		}
 	}
 
-	return DoOut(ctx, func(s *OutScope) error {
-		r, size := s.UseSized(src)
-		w := s.NewOut(out, size)
+	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
+		r, _ := s.UseSized(src)
 		_, err := io.Copy(w, r)
 		return err
 	})
@@ -1538,9 +1607,8 @@ func Process(ctx context.Context, src Source, out OutConfig, fn func(r io.Reader
 	if fn == nil {
 		return nil, ErrNilFunc
 	}
-	return DoOut(ctx, func(s *OutScope) error {
-		r, size := s.UseSized(src)
-		w := s.NewOut(out, size)
+	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
+		r, _ := s.UseSized(src)
 		return fn(r, w)
 	})
 }
@@ -1550,9 +1618,8 @@ func ProcessResult[T any](ctx context.Context, src Source, out OutConfig, fn fun
 	if fn == nil {
 		return nil, zero, ErrNilFunc
 	}
-	return DoOutResult(ctx, func(s *OutScope) (T, error) {
-		r, size := s.UseSized(src)
-		w := s.NewOut(out, size)
+	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (T, error) {
+		r, _ := s.UseSized(src)
 		return fn(r, w)
 	})
 }
@@ -1562,12 +1629,11 @@ func ProcessAtResult[T any](ctx context.Context, src Source, out OutConfig, fn f
 	if fn == nil {
 		return nil, zero, ErrNilFunc
 	}
-	return DoOutResult(ctx, func(s *OutScope) (T, error) {
+	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (T, error) {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
 			return zero, errors.New("fio: cannot get ReaderAt")
 		}
-		w := s.NewOut(out, size)
 		return fn(ra, size, w)
 	})
 }
@@ -1580,7 +1646,7 @@ func ProcessListResult[T any](ctx context.Context, srcs []Source, out OutConfig,
 	if fn == nil {
 		return nil, zero, ErrNilFunc
 	}
-	return DoOutResult(ctx, func(s *OutScope) (T, error) {
+	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (T, error) {
 		readers := make([]io.Reader, 0, len(srcs))
 		var total int64
 		for _, src := range srcs {
@@ -1592,7 +1658,6 @@ func ProcessListResult[T any](ctx context.Context, srcs []Source, out OutConfig,
 				total = -1
 			}
 		}
-		w := s.NewOut(out, total)
 		return fn(readers, w)
 	})
 }
@@ -1601,12 +1666,11 @@ func ProcessAt(ctx context.Context, src Source, out OutConfig, fn func(ra io.Rea
 	if fn == nil {
 		return nil, ErrNilFunc
 	}
-	return DoOut(ctx, func(s *OutScope) error {
+	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
 			return errors.New("fio: cannot get ReaderAt")
 		}
-		w := s.NewOut(out, size)
 		return fn(ra, size, w)
 	})
 }

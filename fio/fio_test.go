@@ -133,8 +133,7 @@ func TestAutoThresholdManager(t *testing.T) {
 func TestOutputWriteRead(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 
-	out, err := DoOut(ctx, func(s *OutScope) error {
-		w := s.NewOut(Out(Txt))
+	out, err := DoOut(ctx, Out(Txt), func(ctx context.Context, s *OutScope, w io.Writer) error {
 		_, err := w.Write([]byte("hello"))
 		return err
 	})
