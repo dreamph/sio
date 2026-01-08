@@ -12,14 +12,12 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/dreamph/sio"
 	"github.com/dreamph/sio/fio"
 )
 
 type sourceFactory struct {
 	name    string
 	makeFio func() fio.Source
-	makeSR  func() sio.StreamReader
 	open    func() (io.ReadCloser, error)
 	cleanup func()
 }
@@ -32,7 +30,6 @@ func newSourceFactory(b *testing.B, kind string, data []byte) sourceFactory {
 		return sourceFactory{
 			name:    "bytes",
 			makeFio: func() fio.Source { return fio.BytesSource(data) },
-			makeSR:  func() sio.StreamReader { return sio.NewBytesReader(data) },
 			open:    func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil },
 			cleanup: func() {
 				// no-op
@@ -47,7 +44,6 @@ func newSourceFactory(b *testing.B, kind string, data []byte) sourceFactory {
 		return sourceFactory{
 			name:    "file",
 			makeFio: func() fio.Source { return fio.PathSource(path) },
-			makeSR:  func() sio.StreamReader { return sio.NewFileReader(path) },
 			open:    func() (io.ReadCloser, error) { return os.Open(path) },
 			cleanup: func() {
 				// temp dir cleanup handled by testing
@@ -61,7 +57,6 @@ func newSourceFactory(b *testing.B, kind string, data []byte) sourceFactory {
 		return sourceFactory{
 			name:    "url",
 			makeFio: func() fio.Source { return fio.URLSource(srv.URL) },
-			makeSR:  func() sio.StreamReader { return sio.NewURLReader(srv.URL) },
 			open: func() (io.ReadCloser, error) {
 				resp, err := http.Get(srv.URL)
 				if err != nil {
@@ -153,9 +148,8 @@ func benchFioDo(b *testing.B, size int, src sourceFactory, mgr fio.IoManager) {
 	ctx := fio.WithSession(context.Background(), ses)
 
 	for i := 0; i < b.N; i++ {
-		out, err := fio.DoOut(ctx, func(s *fio.OutScope) error {
-			r, cSize := s.UseSized(src.makeFio())
-			w := s.NewOut(fio.Out(fio.Txt), cSize)
+		out, err := fio.DoOut(ctx, fio.Out(fio.Txt), func(ctx context.Context, s *fio.OutScope, w io.Writer) error {
+			r, _ := s.UseSized(src.makeFio())
 			_, err := io.Copy(w, r)
 			return err
 		})
@@ -163,45 +157,6 @@ func benchFioDo(b *testing.B, size int, src sourceFactory, mgr fio.IoManager) {
 			b.Fatalf("DoOut: %v", err)
 		}
 		_ = out
-	}
-}
-
-func benchSioTransform(b *testing.B, size int, storage sio.StorageType, src sourceFactory, opsPerSession int) {
-	b.Helper()
-
-	mgr, err := sio.NewIoManager("", storage)
-	if err != nil {
-		b.Fatalf("NewIoManager: %v", err)
-	}
-	defer func() { _ = mgr.Cleanup() }()
-
-	b.ReportAllocs()
-	b.SetBytes(int64(size))
-	b.ResetTimer()
-
-	for i := 0; i < b.N; {
-		ses, err := mgr.NewSession()
-		if err != nil {
-			b.Fatalf("NewSession: %v", err)
-		}
-
-		ctx := sio.WithSession(context.Background(), ses)
-		for j := 0; j < opsPerSession && i < b.N; j++ {
-			out, err := sio.Process(ctx, src.makeSR(), sio.Out(sio.Txt), func(_ context.Context, r io.Reader, w io.Writer) error {
-				_, err := io.Copy(w, r)
-				return err
-			})
-			if err != nil {
-				_ = ses.Cleanup()
-				b.Fatalf("Process: %v", err)
-			}
-			_ = out
-			i++
-		}
-
-		if err := ses.Cleanup(); err != nil {
-			b.Fatalf("Cleanup: %v", err)
-		}
 	}
 }
 
@@ -217,10 +172,9 @@ func BenchmarkCompareFioSio(b *testing.B) {
 	storages := []struct {
 		name string
 		fio  fio.StorageType
-		sio  sio.StorageType
 	}{
-		{name: "memory", fio: fio.Memory, sio: sio.Memory},
-		{name: "file", fio: fio.File, sio: sio.File},
+		{name: "memory", fio: fio.Memory},
+		{name: "file", fio: fio.File},
 	}
 
 	// Create managers once per storage type
@@ -252,11 +206,6 @@ func BenchmarkCompareFioSio(b *testing.B) {
 						src := newSourceFactory(b, sourceKind, data)
 						defer src.cleanup()
 						benchFioDo(b, size, src, managers[storage.fio])
-					})
-					b.Run("sio/"+sourceKind+"/"+storage.name+"/"+sizeLabel+"/"+label, func(b *testing.B) {
-						src := newSourceFactory(b, sourceKind, data)
-						defer src.cleanup()
-						benchSioTransform(b, size, storage.sio, src, opsPerSession)
 					})
 				}
 			}

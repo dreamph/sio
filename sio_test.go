@@ -1198,6 +1198,9 @@ func (d dummySession) Process(ctx context.Context, source StreamReader, out OutC
 func (d dummySession) ProcessList(ctx context.Context, sources []StreamReader, out OutConfig, fn ProcessListFunc) (*Output, error) {
 	return nil, nil
 }
+func (d dummySession) NewOut(out OutConfig, sizeHint ...int64) (*Output, error) {
+	return nil, nil
+}
 func (d dummySession) Cleanup() error { return nil }
 
 func TestToExt(t *testing.T) {

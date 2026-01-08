@@ -174,6 +174,9 @@ type OutConfig struct {
 	ext           string
 	storageType   *StorageType // nil = use session default
 	autoThreshold *int64       // nil = use session default
+	reusePtr      **Output
+	reuseCfg      outReuseCfg
+	reuseEnabled  bool
 }
 
 // OutOption configures output behavior.
@@ -190,6 +193,26 @@ func (f OutOptionFunc) applyOut(o *OutConfig) {
 
 func (st StorageType) applyOut(o *OutConfig) {
 	o.storageType = &st
+}
+
+// OutReuse configures output reuse for Process/ProcessList/BindProcess.
+func OutReuse(outPtr **Output, opts ...OutReuseOpt) OutOption {
+	return OutOptionFunc(func(o *OutConfig) {
+		o.reusePtr = outPtr
+		o.reuseEnabled = true
+		cfg := outReuseCfg{cleanupOld: true, keepMemCap: true, maxMemCap: 0}
+		for _, opt := range opts {
+			if opt != nil {
+				opt.applyOutReuse(&cfg)
+			}
+		}
+		o.reuseCfg = cfg
+	})
+}
+
+// OutResuse is a compatibility alias for OutReuse.
+func OutResuse(outPtr **Output, opts ...OutReuseOpt) OutOption {
+	return OutReuse(outPtr, opts...)
 }
 
 // Out creates output configuration.
@@ -233,6 +256,41 @@ func (o OutConfig) StorageType() *StorageType {
 // AutoThreshold returns the configured threshold, or nil when unset.
 func (o OutConfig) AutoThreshold() *int64 {
 	return o.autoThreshold
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             OutReuse Options                               */
+/* -------------------------------------------------------------------------- */
+
+// OutReuseOpt configures reuse behavior.
+type OutReuseOpt interface {
+	applyOutReuse(*outReuseCfg)
+}
+
+// OutReuseOptFunc adapts a function to OutReuseOpt.
+type OutReuseOptFunc func(*outReuseCfg)
+
+func (f OutReuseOptFunc) applyOutReuse(c *outReuseCfg) { f(c) }
+
+type outReuseCfg struct {
+	cleanupOld bool // default true
+	keepMemCap bool // default true
+	maxMemCap  int64
+}
+
+// WithCleanupOld controls whether to clean old outputs when storage type changes.
+func WithCleanupOld(v bool) OutReuseOpt {
+	return OutReuseOptFunc(func(c *outReuseCfg) { c.cleanupOld = v })
+}
+
+// WithKeepMemCap controls whether to reuse previous memory capacity.
+func WithKeepMemCap(v bool) OutReuseOpt {
+	return OutReuseOptFunc(func(c *outReuseCfg) { c.keepMemCap = v })
+}
+
+// WithMaxMemCap caps the retained memory capacity when reusing outputs.
+func WithMaxMemCap(bytes int64) OutReuseOpt {
+	return OutReuseOptFunc(func(c *outReuseCfg) { c.maxMemCap = bytes })
 }
 
 /* -------------------------------------------------------------------------- */
@@ -626,6 +684,7 @@ type IoSession interface {
 	ReadList(ctx context.Context, sources []StreamReader, fn ReadListFunc) error
 	Process(ctx context.Context, source StreamReader, out OutConfig, fn ProcessFunc) (*Output, error)
 	ProcessList(ctx context.Context, sources []StreamReader, out OutConfig, fn ProcessListFunc) (*Output, error)
+	NewOut(out OutConfig, sizeHint ...int64) (*Output, error)
 	Cleanup() error
 }
 
@@ -704,6 +763,19 @@ func (s *ioSession) storageByThreshold(size, threshold int64) StorageType {
 	return s.storageType
 }
 
+func (s *ioSession) resolveStorageType(out OutConfig, sizeHint int64) StorageType {
+	if out.storageType != nil {
+		return *out.storageType
+	}
+	if out.autoThreshold != nil && *out.autoThreshold > 0 {
+		return s.storageByThreshold(sizeHint, *out.autoThreshold)
+	}
+	if s.autoThreshold > 0 {
+		return s.storageByThreshold(sizeHint, s.autoThreshold)
+	}
+	return s.storageType
+}
+
 // newOutputWithStorage creates output with specified storage type.
 func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*Output, error) {
 	if err := s.ensureOpen(); err != nil {
@@ -751,6 +823,104 @@ func (s *ioSession) newOutputWithStorage(ext string, storageType StorageType) (*
 	return out, nil
 }
 
+// NewOut creates an output for manual writing within this session.
+// Use Output.OpenWriter() to write and Output.OpenReader() to read later.
+func (s *ioSession) NewOut(out OutConfig, sizeHint ...int64) (*Output, error) {
+	if s == nil {
+		return nil, ErrNoSession
+	}
+	if err := s.ensureOpen(); err != nil {
+		return nil, err
+	}
+
+	hint := int64(-1)
+	if len(sizeHint) > 0 {
+		hint = sizeHint[0]
+	}
+
+	storageType := s.resolveStorageType(out, hint)
+	return s.newOutputWithStorage(out.ext, storageType)
+}
+
+func (s *ioSession) newOutputWithReuse(out OutConfig, storageType StorageType, sizeHint int64) (*Output, io.WriteCloser, error) {
+	if out.reusePtr == nil {
+		return nil, nil, errors.New("sio: OutReuse requires out pointer")
+	}
+	if err := s.ensureOpen(); err != nil {
+		return nil, nil, err
+	}
+
+	rcfg := out.reuseCfg
+	if !out.reuseEnabled {
+		rcfg = outReuseCfg{cleanupOld: true, keepMemCap: true, maxMemCap: 0}
+	}
+
+	prev := *out.reusePtr
+	if prev != nil && rcfg.cleanupOld && prev.StorageType() != storageType {
+		_ = prev.cleanup()
+		prev = nil
+		*out.reusePtr = nil
+	}
+
+	var output *Output
+	if prev != nil && prev.StorageType() == storageType {
+		output = prev
+		output.mu.Lock()
+		output.closed = false
+		output.keep = false
+		if storageType == Memory && output.data != nil {
+			output.data = output.data[:0]
+		}
+		output.mu.Unlock()
+	} else {
+		newOut, err := s.newOutputWithStorage(out.ext, storageType)
+		if err != nil {
+			return nil, nil, err
+		}
+		output = newOut
+		*out.reusePtr = output
+	}
+
+	switch storageType {
+	case Memory:
+		output.mu.Lock()
+		old := output.data
+		output.data = nil
+		output.closed = false
+		output.mu.Unlock()
+
+		var buf *bytes.Buffer
+		if rcfg.keepMemCap && cap(old) > 0 {
+			buf = bytes.NewBuffer(old[:0])
+		} else if sizeHint > 0 {
+			buf = bytes.NewBuffer(make([]byte, 0, int(sizeHint)))
+		} else {
+			buf = &bytes.Buffer{}
+		}
+
+		wc := &memReuseWriteCloser{buf: buf, output: output, cfg: rcfg}
+		return output, wc, nil
+
+	default: // File
+		if prev != nil && prev.StorageType() == File && rcfg.cleanupOld {
+			_ = prev.cleanup()
+			newOut, err := s.newOutputWithStorage(out.ext, File)
+			if err != nil {
+				return nil, nil, err
+			}
+			output = newOut
+			*out.reusePtr = output
+		}
+
+		w, err := output.OpenWriter(sizeHint)
+		if err != nil {
+			_ = output.cleanup()
+			return nil, nil, err
+		}
+		return output, w, nil
+	}
+}
+
 func (s *ioSession) Process(ctx context.Context, source StreamReader, out OutConfig, fn ProcessFunc) (*Output, error) {
 	if source == nil {
 		return nil, ErrNilSource
@@ -770,15 +940,24 @@ func (s *ioSession) Process(ctx context.Context, source StreamReader, out OutCon
 	defer source.Cleanup()
 
 	storageType := s.decideStorageType(source, out)
-	output, err := s.newOutputWithStorage(out.ext, storageType)
-	if err != nil {
-		return nil, err
-	}
-
 	sizeHint := SizeAny(source)
-	w, err := output.OpenWriter(sizeHint)
+	var (
+		output *Output
+		w      io.WriteCloser
+	)
+	if out.reuseEnabled {
+		output, w, err = s.newOutputWithReuse(out, storageType, sizeHint)
+	} else {
+		output, err = s.newOutputWithStorage(out.ext, storageType)
+		if err != nil {
+			return nil, err
+		}
+		w, err = output.OpenWriter(sizeHint)
+	}
 	if err != nil {
-		_ = output.cleanup()
+		if output != nil {
+			_ = output.cleanup()
+		}
 		return nil, err
 	}
 
@@ -814,15 +993,24 @@ func (s *ioSession) ProcessList(ctx context.Context, sources []StreamReader, out
 	defer rl.Close()
 
 	storageType := s.decideStorageTypeForList(sources, out)
-	output, err := s.newOutputWithStorage(out.ext, storageType)
-	if err != nil {
-		return nil, err
-	}
-
 	sizeHint := SizeFromStreamList(sources)
-	w, err := output.OpenWriter(sizeHint)
+	var (
+		output *Output
+		w      io.WriteCloser
+	)
+	if out.reuseEnabled {
+		output, w, err = s.newOutputWithReuse(out, storageType, sizeHint)
+	} else {
+		output, err = s.newOutputWithStorage(out.ext, storageType)
+		if err != nil {
+			return nil, err
+		}
+		w, err = output.OpenWriter(sizeHint)
+	}
 	if err != nil {
-		_ = output.cleanup()
+		if output != nil {
+			_ = output.cleanup()
+		}
 		return nil, err
 	}
 
@@ -1053,6 +1241,41 @@ func (b *bytesWriteCloser) Close() error {
 		b.output.data = b.buf.Bytes()
 		b.output.mu.Unlock()
 	}
+	return nil
+}
+
+// memReuseWriteCloser reuses buffer capacity between outputs.
+type memReuseWriteCloser struct {
+	buf    *bytes.Buffer
+	output *Output
+	cfg    outReuseCfg
+}
+
+func (w *memReuseWriteCloser) Write(p []byte) (int, error) { return w.buf.Write(p) }
+
+func (w *memReuseWriteCloser) Close() error {
+	if w.output == nil {
+		return nil
+	}
+
+	w.output.mu.Lock()
+	w.output.data = w.buf.Bytes()
+	w.output.mu.Unlock()
+
+	if w.cfg.maxMemCap > 0 && int64(w.buf.Cap()) > w.cfg.maxMemCap {
+		b := w.output.data
+		limit := w.cfg.maxMemCap
+		if int64(len(b)) < limit {
+			limit = int64(len(b))
+		}
+		nb := make([]byte, 0, limit)
+		nb = append(nb, b...)
+		w.buf = bytes.NewBuffer(nb)
+		w.output.mu.Lock()
+		w.output.data = w.buf.Bytes()
+		w.output.mu.Unlock()
+	}
+
 	return nil
 }
 
@@ -1838,6 +2061,10 @@ func ProcessListResult[T any](ctx context.Context, sources []StreamReader, out O
 // tryBytesFastPath attempts direct copy for BytesReader → Memory without io.Copy overhead.
 // Returns (output, true) if fast path was used, (nil, false) otherwise.
 func tryBytesFastPath(ctx context.Context, src StreamReader, out OutConfig) (*Output, bool) {
+	if out.reuseEnabled {
+		return nil, false
+	}
+
 	br, ok := src.(*BytesReader)
 	if !ok {
 		return nil, false
@@ -2640,14 +2867,25 @@ func BindProcess(ctx context.Context, out OutConfig, fn func(ctx context.Context
 	b := &Binder{}
 	defer b.cleanup()
 
-	output, err := iSes.newOutputWithStorage(out.ext, out.getStorageType(iSes.storageType))
-	if err != nil {
-		return nil, err
+	storageType := out.getStorageType(iSes.storageType)
+	var (
+		output *Output
+		w      io.WriteCloser
+		err    error
+	)
+	if out.reuseEnabled {
+		output, w, err = iSes.newOutputWithReuse(out, storageType, -1)
+	} else {
+		output, err = iSes.newOutputWithStorage(out.ext, storageType)
+		if err != nil {
+			return nil, err
+		}
+		w, err = output.OpenWriter()
 	}
-
-	w, err := output.OpenWriter()
 	if err != nil {
-		_ = output.cleanup()
+		if output != nil {
+			_ = output.cleanup()
+		}
 		return nil, err
 	}
 	if err := fn(ctx, b, w); err != nil {
@@ -2687,14 +2925,25 @@ func BindProcessResult[T any](ctx context.Context, out OutConfig, fn func(ctx co
 	b := &Binder{}
 	defer b.cleanup()
 
-	output, err := iSes.newOutputWithStorage(out.ext, out.getStorageType(iSes.storageType))
-	if err != nil {
-		return nil, nil, err
+	storageType := out.getStorageType(iSes.storageType)
+	var (
+		output *Output
+		w      io.WriteCloser
+		err    error
+	)
+	if out.reuseEnabled {
+		output, w, err = iSes.newOutputWithReuse(out, storageType, -1)
+	} else {
+		output, err = iSes.newOutputWithStorage(out.ext, storageType)
+		if err != nil {
+			return nil, nil, err
+		}
+		w, err = output.OpenWriter()
 	}
-
-	w, err := output.OpenWriter()
 	if err != nil {
-		_ = output.cleanup()
+		if output != nil {
+			_ = output.cleanup()
+		}
 		return nil, nil, err
 	}
 	res, execErr := fn(ctx, b, w)
