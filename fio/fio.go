@@ -483,15 +483,16 @@ func (o *Output) OpenWriter(sizeHint ...int64) (io.WriteCloser, error) {
 	}
 
 	if o.storageType == Memory {
-		buf := &bytes.Buffer{}
+		var buf *bytes.Buffer
+		var preallocateData []byte
 		if len(sizeHint) > 0 && sizeHint[0] > 0 {
-			n := sizeHint[0]
-			if n > 64<<20 { // cap pre-grow at 64MB
-				n = 64 << 20
-			}
-			buf.Grow(int(n))
+			// Pre-allocate with exact capacity to avoid grow
+			preallocateData = make([]byte, 0, int(sizeHint[0]))
+			buf = bytes.NewBuffer(preallocateData)
+		} else {
+			buf = &bytes.Buffer{}
 		}
-		return &bytesWriteCloser{buf: buf, output: o}, nil
+		return &bytesWriteCloser{buf: buf, output: o, preallocateData: preallocateData}, nil
 	}
 
 	return os.Create(o.path)
@@ -962,14 +963,36 @@ func (o OutConfig) AutoThreshold() *int64        { return o.autoThreshold }
 /* -------------------------------------------------------------------------- */
 
 type bytesWriteCloser struct {
-	buf    *bytes.Buffer
-	output *Output
+	buf             *bytes.Buffer
+	output          *Output
+	written         bool
+	preallocateData []byte // backing slice for pre-allocated buffer
 }
 
-func (b *bytesWriteCloser) Write(p []byte) (int, error) { return b.buf.Write(p) }
+func (b *bytesWriteCloser) Write(p []byte) (int, error) {
+	// Fast path: single large write (from bytes.Reader.WriteTo)
+	// When io.Copy calls WriteTo, it writes everything at once
+	if !b.written && b.buf.Len() == 0 && len(p) >= 64<<10 {
+		b.written = true
+		var data []byte
+		// Reuse pre-allocated buffer if available and fits
+		if b.preallocateData != nil && len(p) <= cap(b.preallocateData) {
+			data = b.preallocateData[:len(p)]
+		} else {
+			data = make([]byte, len(p))
+		}
+		copy(data, p)
+		b.output.mu.Lock()
+		b.output.data = data
+		b.output.mu.Unlock()
+		return len(p), nil
+	}
+	b.written = true
+	return b.buf.Write(p)
+}
 
 func (b *bytesWriteCloser) Close() error {
-	if b.output != nil {
+	if b.output != nil && b.output.data == nil {
 		b.output.mu.Lock()
 		b.output.data = b.buf.Bytes()
 		b.output.mu.Unlock()
@@ -1423,8 +1446,8 @@ func Do[T any](ctx context.Context, fn func(s *Scope) (T, error)) (T, error) {
 	}
 
 	s := &Scope{
-		ctx:      ctx,
-		cleanups: make([]func() error, 0, 4),
+		ctx: ctx,
+		// cleanups: nil - lazy allocate only when needed
 	}
 
 	res, err := fn(s)
@@ -1443,8 +1466,8 @@ func DoOut(ctx context.Context, fn func(s *OutScope) error) (*Output, error) {
 
 	s := &OutScope{
 		Scope: Scope{
-			ctx:      ctx,
-			cleanups: make([]func() error, 0, 4),
+			ctx: ctx,
+			// cleanups: nil - lazy allocate only when needed
 		},
 	}
 
@@ -1465,8 +1488,8 @@ func DoOutResult[T any](ctx context.Context, fn func(s *OutScope) (T, error)) (*
 
 	s := &OutScope{
 		Scope: Scope{
-			ctx:      ctx,
-			cleanups: make([]func() error, 0, 4),
+			ctx: ctx,
+			// cleanups: nil - lazy allocate only when needed
 		},
 	}
 
@@ -1483,6 +1506,26 @@ func DoOutResult[T any](ctx context.Context, fn func(s *OutScope) (T, error)) (*
 /* -------------------------------------------------------------------------- */
 
 func Copy(ctx context.Context, src Source, out OutConfig) (*Output, error) {
+	// Fast path: bytesSource to Memory (avoids io.Copy overhead)
+	if b, ok := src.(bytesSource); ok && b != nil && !out.reuseEnabled {
+		ses := Session(ctx)
+		if ses != nil {
+			if iSes, ok := ses.(*ioSession); ok {
+				if iSes.ensureOpen() == nil && resolveStorageType(out, iSes, int64(len(b))) == Memory {
+					output, err := iSes.newOutput(out.ext, Memory)
+					if err == nil && len(b) > 0 {
+						data := make([]byte, len(b))
+						copy(data, b)
+						output.mu.Lock()
+						output.data = data
+						output.mu.Unlock()
+						return output, nil
+					}
+				}
+			}
+		}
+	}
+
 	return DoOut(ctx, func(s *OutScope) error {
 		r, size := s.UseSized(src)
 		w := s.NewOut(out, size)
