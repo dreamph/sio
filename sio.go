@@ -39,16 +39,6 @@ const (
 	Zip = ".zip"
 )
 
-// Input source kinds
-const (
-	KindFile      = "file"
-	KindURL       = "url"
-	KindMultipart = "multipart"
-	KindMemory    = "memory"
-	KindReader    = "reader"
-	KindStream    = "stream"
-)
-
 // MB converts megabytes to bytes.
 func MB(size int64) int64 {
 	return size * 1024 * 1024
