@@ -38,6 +38,11 @@ const (
 )
 
 const (
+	defaultMaxPreallocate = 1 << 20  // 1MB
+	defaultSpillThreshold = 64 << 20 // 64MB
+)
+
+const (
 	KindFile      = "file"
 	KindURL       = "url"
 	KindMultipart = "multipart"
@@ -50,6 +55,7 @@ const DefaultBaseTempDir = "./temp"
 
 func MB(size int64) int64        { return size * 1024 * 1024 }
 func ToExt(format string) string { return "." + format }
+func ptrInt64(v int64) *int64    { return &v }
 
 // Void replaces struct{} when you want “no value”.
 type Void struct{}
@@ -421,13 +427,14 @@ func makeReusableFile(in *Input, f *os.File) (*Input, error) {
 /* -------------------------------------------------------------------------- */
 
 type Output struct {
-	mu          sync.Mutex
-	path        string
-	ses         IoSession
-	closed      bool
-	keep        bool
-	data        []byte
-	storageType StorageType
+	mu                  sync.Mutex
+	path                string
+	ses                 IoSession
+	closed              bool
+	keep                bool
+	data                []byte
+	storageType         StorageType
+	maxPreallocateBytes int64
 }
 
 func (o *Output) Path() string {
@@ -484,8 +491,21 @@ func (o *Output) OpenWriter(sizeHint ...int64) (io.WriteCloser, error) {
 		var buf *bytes.Buffer
 		var preallocateData []byte
 		if len(sizeHint) > 0 && sizeHint[0] > 0 {
-			// Pre-allocate with exact capacity to avoid grow
-			preallocateData = make([]byte, 0, int(sizeHint[0]))
+			// Pre-allocate with capped capacity to avoid large spikes
+			capHint := sizeHint[0]
+			maxCap := o.maxPreallocateBytes
+			if maxCap > 0 && capHint > maxCap {
+				capHint = maxCap
+			}
+			maxInt := int64(int(^uint(0) >> 1))
+			if capHint > maxInt {
+				if maxCap > 0 && maxCap < maxInt {
+					capHint = maxCap
+				} else {
+					capHint = maxInt
+				}
+			}
+			preallocateData = make([]byte, 0, int(capHint))
 			buf = bytes.NewBuffer(preallocateData)
 		} else {
 			buf = &bytes.Buffer{}
@@ -620,26 +640,45 @@ type IoSession interface {
 }
 
 type ioSession struct {
-	mu            sync.Mutex
-	manager       IoManager
-	dir           string
-	closed        bool
-	outputs       []*Output
-	cleanupFns    []func() error
-	storageType   StorageType
-	autoThreshold int64
+	mu                  sync.Mutex
+	manager             IoManager
+	dir                 string
+	closed              bool
+	outputs             []*Output
+	cleanupFns          []func() error
+	storageType         StorageType
+	autoFileThreshold   int64
+	spillThreshold      int64
+	maxPreallocateBytes int64
 }
 
 func resolveStorageType(out OutConfig, ses *ioSession, sizeHint int64) StorageType {
 	storageType := ses.storageType
 	if out.storageType != nil {
 		storageType = *out.storageType
-	} else if out.autoThreshold != nil && *out.autoThreshold > 0 && sizeHint >= *out.autoThreshold {
+	} else if out.autoFileThreshold != nil && *out.autoFileThreshold > 0 && sizeHint >= *out.autoFileThreshold {
 		storageType = File
-	} else if sizeHint >= 0 && ses.autoThreshold > 0 && sizeHint >= ses.autoThreshold {
+	} else if sizeHint >= 0 && ses.autoFileThreshold > 0 && sizeHint >= ses.autoFileThreshold {
 		storageType = File
 	}
+
+	spill := ses.spillThreshold
+	if out.spillThreshold != nil {
+		spill = *out.spillThreshold
+	}
+	if sizeHint >= 0 && storageType == Memory && spill > 0 && sizeHint >= spill {
+		storageType = File
+	}
+
 	return storageType
+}
+
+func resolveMaxPreallocate(out OutConfig, ses *ioSession) int64 {
+	max := ses.maxPreallocateBytes
+	if out.maxPreallocateBytes != nil {
+		max = *out.maxPreallocateBytes
+	}
+	return max
 }
 
 func (s *ioSession) Dir() string {
@@ -666,7 +705,7 @@ func (s *ioSession) newOutput(ext string, storageType StorageType) (*Output, err
 	defer s.mu.Unlock()
 
 	if storageType == Memory {
-		out := &Output{ses: s, storageType: Memory}
+		out := &Output{ses: s, storageType: Memory, maxPreallocateBytes: s.maxPreallocateBytes}
 		s.outputs = append(s.outputs, out)
 		return out, nil
 	}
@@ -686,7 +725,7 @@ func (s *ioSession) newOutput(ext string, storageType StorageType) (*Output, err
 	}
 	_ = f.Close()
 
-	out := &Output{path: f.Name(), ses: s, storageType: File}
+	out := &Output{path: f.Name(), ses: s, storageType: File, maxPreallocateBytes: s.maxPreallocateBytes}
 	s.outputs = append(s.outputs, out)
 	return out, nil
 }
@@ -712,6 +751,7 @@ func (s *ioSession) NewOut(out OutConfig, sizeHint ...int64) (*Output, error) {
 	if err != nil {
 		return nil, err
 	}
+	output.maxPreallocateBytes = resolveMaxPreallocate(out, s)
 
 	return output, nil
 }
@@ -742,13 +782,23 @@ func (s *ioSession) Cleanup() error {
 	// 1. Identify files to keep and cleanup memory/non-kept outputs
 	keepMap := make(map[string]struct{})
 	for _, out := range s.outputs {
+		var (
+			keep        bool
+			closed      bool
+			storageType StorageType
+			path        string
+		)
 		out.mu.Lock()
-		if out.storageType == File && out.keep && !out.closed {
-			keepMap[filepath.Clean(out.path)] = struct{}{}
-		} else {
-			errs = errors.Join(errs, out.cleanup())
-		}
+		keep = out.keep
+		closed = out.closed
+		storageType = out.storageType
+		path = out.path
 		out.mu.Unlock()
+		if storageType == File && keep && !closed {
+			keepMap[filepath.Clean(path)] = struct{}{}
+			continue
+		}
+		errs = errors.Join(errs, out.cleanup())
 	}
 
 	// 2. Run other cleanup functions
@@ -819,22 +869,46 @@ type ManagerOptionFunc func(*managerConfig)
 func (f ManagerOptionFunc) applyManager(c *managerConfig) { f(c) }
 
 type managerConfig struct {
-	autoThreshold int64
+	autoFileThreshold   int64
+	spillThreshold      *int64
+	maxPreallocateBytes *int64
 }
 
 type thresholdOption int64
 
-func (t thresholdOption) applyManager(c *managerConfig) { c.autoThreshold = int64(t) }
+func (t thresholdOption) applyManager(c *managerConfig) { c.autoFileThreshold = int64(t) }
 
 // WithThreshold sets session auto file threshold (bytes). 0 = disabled.
 func WithThreshold(bytes int64) thresholdOption { return thresholdOption(bytes) }
 
+type spillThresholdOption int64
+
+func (t spillThresholdOption) applyManager(c *managerConfig) { c.spillThreshold = ptrInt64(int64(t)) }
+func (t spillThresholdOption) applyOut(o *OutConfig)         { o.spillThreshold = ptrInt64(int64(t)) }
+
+// WithSpillThreshold forces Memory to spill to File when sizeHint >= bytes.
+// Set to 0 to disable spill-to-file behavior.
+func WithSpillThreshold(bytes int64) spillThresholdOption { return spillThresholdOption(bytes) }
+
+type maxPreallocateOption int64
+
+func (t maxPreallocateOption) applyManager(c *managerConfig) {
+	c.maxPreallocateBytes = ptrInt64(int64(t))
+}
+func (t maxPreallocateOption) applyOut(o *OutConfig) { o.maxPreallocateBytes = ptrInt64(int64(t)) }
+
+// WithMaxPreallocate caps memory pre-allocation when sizeHint is provided.
+// Set to 0 to disable the cap.
+func WithMaxPreallocate(bytes int64) maxPreallocateOption { return maxPreallocateOption(bytes) }
+
 type manager struct {
-	mu            sync.Mutex
-	baseDir       string
-	closed        bool
-	storageType   StorageType
-	autoThreshold int64
+	mu                  sync.Mutex
+	baseDir             string
+	closed              bool
+	storageType         StorageType
+	autoFileThreshold   int64
+	spillThreshold      int64
+	maxPreallocateBytes int64
 }
 
 func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption) (IoManager, error) {
@@ -844,13 +918,27 @@ func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption
 			opt.applyManager(config)
 		}
 	}
+	spill := int64(defaultSpillThreshold)
+	if config.spillThreshold != nil {
+		spill = *config.spillThreshold
+	}
+	maxPreallocate := int64(defaultMaxPreallocate)
+	if config.maxPreallocateBytes != nil {
+		maxPreallocate = *config.maxPreallocateBytes
+	}
 
 	if strings.TrimSpace(baseDir) == "" {
 		dir, err := os.MkdirTemp("", "fio-")
 		if err != nil {
 			return nil, err
 		}
-		return &manager{baseDir: dir, storageType: storageType, autoThreshold: config.autoThreshold}, nil
+		return &manager{
+			baseDir:             dir,
+			storageType:         storageType,
+			autoFileThreshold:   config.autoFileThreshold,
+			spillThreshold:      spill,
+			maxPreallocateBytes: maxPreallocate,
+		}, nil
 	}
 
 	baseDir = filepath.Clean(baseDir)
@@ -858,7 +946,13 @@ func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption
 		return nil, err
 	}
 
-	return &manager{baseDir: baseDir, storageType: storageType, autoThreshold: config.autoThreshold}, nil
+	return &manager{
+		baseDir:             baseDir,
+		storageType:         storageType,
+		autoFileThreshold:   config.autoFileThreshold,
+		spillThreshold:      spill,
+		maxPreallocateBytes: maxPreallocate,
+	}, nil
 }
 
 func (m *manager) NewSession() (IoSession, error) {
@@ -875,10 +969,12 @@ func (m *manager) NewSession() (IoSession, error) {
 	}
 
 	return &ioSession{
-		manager:       m,
-		dir:           dir,
-		storageType:   m.storageType,
-		autoThreshold: m.autoThreshold,
+		manager:             m,
+		dir:                 dir,
+		storageType:         m.storageType,
+		autoFileThreshold:   m.autoFileThreshold,
+		spillThreshold:      m.spillThreshold,
+		maxPreallocateBytes: m.maxPreallocateBytes,
 	}, nil
 }
 
@@ -924,12 +1020,14 @@ func Session(ctx context.Context) IoSession {
 /* -------------------------------------------------------------------------- */
 
 type OutConfig struct {
-	ext           string
-	storageType   *StorageType
-	autoThreshold *int64
-	reusePtr      **Output
-	reuseCfg      outReuseCfg
-	reuseEnabled  bool
+	ext                 string
+	storageType         *StorageType
+	autoFileThreshold   *int64
+	spillThreshold      *int64
+	maxPreallocateBytes *int64
+	reusePtr            **Output
+	reuseCfg            outReuseCfg
+	reuseEnabled        bool
 }
 
 type OutOption interface {
@@ -972,7 +1070,7 @@ func WithOut(ext string, opts ...OutOption) OutConfig { return Out(ext, opts...)
 
 func (o OutConfig) Ext() string                  { return o.ext }
 func (o OutConfig) StorageTypeVal() *StorageType { return o.storageType }
-func (o OutConfig) AutoThreshold() *int64        { return o.autoThreshold }
+func (o OutConfig) AutoThreshold() *int64        { return o.autoFileThreshold }
 
 /* -------------------------------------------------------------------------- */
 /*                              bytesWriteCloser                              */
@@ -1046,6 +1144,7 @@ func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, 
 	if err != nil {
 		return nil, err
 	}
+	output.maxPreallocateBytes = resolveMaxPreallocate(out, iSes)
 
 	w, err := output.OpenWriter(hint)
 	if err != nil {
@@ -1456,6 +1555,9 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 		out = newOut
 		*outPtr = out
 	}
+	out.mu.Lock()
+	out.maxPreallocateBytes = resolveMaxPreallocate(cfg, iSes)
+	out.mu.Unlock()
 
 	switch storageType {
 	case Memory:
