@@ -193,7 +193,6 @@ func benchSioDo(b *testing.B, size int, src sourceFactory, mgr sio.IoManager) {
 
 func BenchmarkCompareFioSio(b *testing.B) {
 	useMmap := envBool("FIO_BENCH_USE_MMAP", false)
-	useCopyBufPool := envBool("FIO_BENCH_USE_COPYBUFPOOL", false)
 
 	opsPerSessionList := []int{1}
 	sizes := []int{
@@ -222,7 +221,6 @@ func BenchmarkCompareFioSio(b *testing.B) {
 			fio.WithSpillThreshold(0),
 			fio.WithThreshold(0),
 			fio.WithMmap(useMmap),
-			fio.WithCopyBufferPool(useCopyBufPool),
 		)
 		if err != nil {
 			b.Fatalf("NewIoManager(fio): %v", err)
