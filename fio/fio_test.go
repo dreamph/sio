@@ -266,6 +266,33 @@ func TestOutReuseMemory(t *testing.T) {
 	}
 }
 
+func TestReusableFileInput(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "in.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	in, err := OpenIn(ctx, PathSource(path), Reusable())
+	if err != nil {
+		t.Fatalf("OpenIn: %v", err)
+	}
+	t.Cleanup(func() { _ = in.Close() })
+
+	for i := 0; i < 2; i++ {
+		out, err := Copy(ctx, InputSource(in), Out(Txt, Memory))
+		if err != nil {
+			t.Fatalf("Copy %d: %v", i, err)
+		}
+		b, _ := out.Bytes()
+		if string(b) != "hello" {
+			t.Fatalf("Copy %d bytes = %q", i, string(b))
+		}
+	}
+}
+
 func TestSizeHelpers(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 
