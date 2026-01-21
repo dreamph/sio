@@ -353,6 +353,25 @@ fio.ErrNoSession              // session is nil
 fio.ErrFileStorageUnavailable // file storage requires directory
 fio.ErrInvalidSessionType     // invalid session type
 fio.ErrNilFunc                // function is nil
+fio.ErrEmptyPath              // empty path string
+fio.ErrEmptyURL               // empty URL string
+fio.ErrOutputCleaned          // output already cleaned up
+fio.ErrNilOutHandle           // nil OutHandle
+fio.ErrNilOutScope            // nil out-scope
+fio.ErrNewOutMultiple         // NewOut called more than once
+fio.ErrOutReuseRequiresPtr    // OutReuse requires output pointer
+fio.ErrCannotGetReaderAt      // reader does not support ReaderAt
+fio.ErrInputNotReusable       // input is not reusable
+fio.ErrCannotResetInput       // input reset failed
+fio.ErrToReaderAtNilReader    // ToReaderAt called with nil reader
+```
+
+Use `errors.Is` to check wrapped errors:
+
+```go
+if errors.Is(err, fio.ErrDownloadFailed) {
+    // handle URL download failures
+}
 ```
 
 ## Platform Support

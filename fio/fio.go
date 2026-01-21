@@ -106,6 +106,17 @@ var (
 	ErrFileStorageUnavailable = errors.New("fio: file storage requires directory")
 	ErrInvalidSessionType     = errors.New("fio: invalid session type")
 	ErrNilFunc                = errors.New("fio: fn is nil")
+	ErrEmptyPath              = errors.New("fio: empty path")
+	ErrEmptyURL               = errors.New("fio: empty url")
+	ErrOutputCleaned          = errors.New("fio: output is cleaned up")
+	ErrNilOutHandle           = errors.New("fio: nil OutHandle")
+	ErrNilOutScope            = errors.New("fio: nil out-scope")
+	ErrNewOutMultiple         = errors.New("fio: NewOut called more than once")
+	ErrOutReuseRequiresPtr    = errors.New("fio: OutReuse requires out pointer")
+	ErrCannotGetReaderAt      = errors.New("fio: cannot get ReaderAt")
+	ErrInputNotReusable       = errors.New("fio: input is not reusable")
+	ErrCannotResetInput       = errors.New("fio: cannot reset input")
+	ErrToReaderAtNilReader    = errors.New("fio: ToReaderAt: nil reader")
 )
 
 /* -------------------------------------------------------------------------- */
@@ -153,7 +164,7 @@ type pathSource string
 func (p pathSource) open(ctx context.Context) (io.ReadCloser, func() error, int64, string, string, error) {
 	path := strings.TrimSpace(string(p))
 	if path == "" {
-		return nil, nil, -1, "", "", errors.New("fio: empty path")
+		return nil, nil, -1, "", "", ErrEmptyPath
 	}
 	rc, cleanup, size, err := openFileDirect(path)
 	if err != nil {
@@ -167,7 +178,7 @@ type urlSource string
 func (u urlSource) open(ctx context.Context) (io.ReadCloser, func() error, int64, string, string, error) {
 	urlStr := strings.TrimSpace(string(u))
 	if urlStr == "" {
-		return nil, nil, -1, "", "", errors.New("fio: empty url")
+		return nil, nil, -1, "", "", ErrEmptyURL
 	}
 	rc, cleanup, size, err := openURLDirect(ctx, urlStr)
 	if err != nil {
@@ -315,7 +326,7 @@ func (in *Input) Reset() error {
 		return errors.New("fio: nil input")
 	}
 	if !in.reusable {
-		return errors.New("fio: input is not reusable")
+		return ErrInputNotReusable
 	}
 	if !in.needsReset {
 		return nil
@@ -341,7 +352,7 @@ func (in *Input) Reset() error {
 		return err
 	}
 
-	return errors.New("fio: cannot reset input")
+	return ErrCannotResetInput
 }
 
 type readerAtCloser struct{ r *io.SectionReader }
@@ -482,7 +493,7 @@ func (o *Output) OpenReader() (io.ReadCloser, error) {
 	defer o.mu.Unlock()
 
 	if o.closed {
-		return nil, errors.New("fio: output is cleaned up")
+		return nil, ErrOutputCleaned
 	}
 	if o.storageType == Memory {
 		return io.NopCloser(bytes.NewReader(o.data)), nil
@@ -495,7 +506,7 @@ func (o *Output) OpenWriter(sizeHint ...int64) (io.WriteCloser, error) {
 	defer o.mu.Unlock()
 
 	if o.closed {
-		return nil, errors.New("fio: output is cleaned up")
+		return nil, ErrOutputCleaned
 	}
 
 	if o.storageType == Memory {
@@ -617,7 +628,7 @@ type OutHandle struct {
 
 func (h *OutHandle) Finalize() (*Output, error) {
 	if h == nil {
-		return nil, errors.New("fio: nil OutHandle")
+		return nil, ErrNilOutHandle
 	}
 	if h.done {
 		return h.output, nil
@@ -1442,7 +1453,7 @@ type lazyOutWriter struct {
 
 func (w *lazyOutWriter) Write(p []byte) (int, error) {
 	if w.scope == nil {
-		return 0, errors.New("fio: nil out-scope")
+		return 0, ErrNilOutScope
 	}
 	if w.writer == nil {
 		w.writer = w.scope.ensureOutWriter()
@@ -1452,7 +1463,7 @@ func (w *lazyOutWriter) Write(p []byte) (int, error) {
 
 func (w *lazyOutWriter) ReadFrom(r io.Reader) (int64, error) {
 	if w.scope == nil {
-		return 0, errors.New("fio: nil out-scope")
+		return 0, ErrNilOutScope
 	}
 	if w.writer == nil {
 		w.writer = w.scope.ensureOutWriter()
@@ -1477,7 +1488,7 @@ func (s *OutScope) ensureOutWriter() io.Writer {
 // NewOut creates output writer (only available in OutScope).
 func (s *OutScope) NewOut(out OutConfig, sizeHint ...int64) io.Writer {
 	if s.outHandle != nil {
-		err := errors.New("fio: NewOut called more than once")
+		err := ErrNewOutMultiple
 		s.err = errors.Join(s.err, err)
 		return errWriter{err}
 	}
@@ -1586,15 +1597,15 @@ func (w *memWriteCloser) Close() error {
 
 func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 	if s == nil {
-		return errWriter{errors.New("fio: nil out-scope")}
+		return errWriter{ErrNilOutScope}
 	}
 	if s.outHandle != nil {
-		err := errors.New("fio: NewOut called more than once")
+		err := ErrNewOutMultiple
 		s.err = errors.Join(s.err, err)
 		return errWriter{err}
 	}
 	if cfg.reusePtr == nil {
-		err := errors.New("fio: OutReuse requires out pointer")
+		err := ErrOutReuseRequiresPtr
 		s.err = errors.Join(s.err, err)
 		return errWriter{err}
 	}
@@ -2054,7 +2065,7 @@ func ProcessAtResult[T any](ctx context.Context, src Source, out OutConfig, fn f
 	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (T, error) {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
-			return zero, errors.New("fio: cannot get ReaderAt")
+			return zero, ErrCannotGetReaderAt
 		}
 		return fn(ra, size, w)
 	})
@@ -2091,7 +2102,7 @@ func ProcessAt(ctx context.Context, src Source, out OutConfig, fn func(ra io.Rea
 	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
-			return errors.New("fio: cannot get ReaderAt")
+			return ErrCannotGetReaderAt
 		}
 		return fn(ra, size, w)
 	})
@@ -2126,7 +2137,7 @@ func ReadAt[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt, size
 	return Do(ctx, func(s *Scope) (T, error) {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
-			return zero, errors.New("fio: cannot get ReaderAt")
+			return zero, ErrCannotGetReaderAt
 		}
 		return fn(ra, size)
 	})
@@ -2139,7 +2150,7 @@ func ReadAtResult[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt
 	return Do(ctx, func(s *Scope) (*T, error) {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
-			return nil, errors.New("fio: cannot get ReaderAt")
+			return nil, ErrCannotGetReaderAt
 		}
 		return fn(ra, size)
 	})
@@ -2541,7 +2552,7 @@ func unwrapReaderAt(r io.ReaderAt) io.ReaderAt {
 // - If too large → spills to temporary file.
 func ToReaderAt(ctx context.Context, r io.Reader, opts ...ToReaderAtOption) (*ReaderAtResult, error) {
 	if r == nil {
-		return nil, errors.New("fio: ToReaderAt: nil reader")
+		return nil, ErrToReaderAtNilReader
 	}
 
 	o := ToReaderAtOptions{
