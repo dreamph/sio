@@ -42,15 +42,6 @@ const (
 	defaultSpillThreshold = 64 << 20 // 64MB
 )
 
-const copyBufSize = 256 << 10            // 256KB
-const smallFileCopyThreshold = 256 << 10 // 256KB
-
-var copyBufPool = sync.Pool{
-	New: func() any {
-		return make([]byte, copyBufSize)
-	},
-}
-
 const (
 	KindFile      = "file"
 	KindURL       = "url"
@@ -683,7 +674,6 @@ type ioSession struct {
 	autoFileThreshold   int64
 	spillThreshold      int64
 	maxPreallocateBytes int64
-	useCopyBufPool      bool
 	useMmap             bool
 }
 
@@ -732,37 +722,67 @@ func (s *ioSession) ensureOpen() error {
 }
 
 func (s *ioSession) newOutput(ext string, storageType StorageType) (*Output, error) {
-	if err := s.ensureOpen(); err != nil {
-		return nil, err
+	out, _, err := s.newOutputWithFile(ext, storageType)
+	return out, err
+}
+
+// newOutputWithFile creates an output and returns the open file handle for File storage.
+// The caller is responsible for closing the file. For Memory storage, file is nil.
+func (s *ioSession) newOutputWithFile(ext string, storageType StorageType) (*Output, *os.File, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, nil, ErrIoSessionClosed
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if storageType == Memory {
-		out := &Output{ses: s, storageType: Memory, maxPreallocateBytes: s.maxPreallocateBytes}
+		out := &Output{
+			ses:                 s,
+			storageType:         Memory,
+			maxPreallocateBytes: s.maxPreallocateBytes,
+		}
 		s.outputs = append(s.outputs, out)
-		return out, nil
+		s.mu.Unlock()
+		return out, nil, nil
 	}
 
 	if s.dir == "" {
-		return nil, ErrFileStorageUnavailable
+		s.mu.Unlock()
+		return nil, nil, ErrFileStorageUnavailable
 	}
 
 	pattern := "*"
 	if ext != "" {
 		pattern += ext
 	}
+	dir := s.dir
+	maxPreallocate := s.maxPreallocateBytes
+	s.mu.Unlock()
 
-	f, err := os.CreateTemp(s.dir, pattern)
+	// CreateTemp outside of lock to reduce lock contention
+	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	_ = f.Close()
 
-	out := &Output{path: f.Name(), ses: s, storageType: File, maxPreallocateBytes: s.maxPreallocateBytes}
+	out := &Output{
+		path:                f.Name(),
+		ses:                 s,
+		storageType:         File,
+		maxPreallocateBytes: maxPreallocate,
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return nil, nil, ErrIoSessionClosed
+	}
 	s.outputs = append(s.outputs, out)
-	return out, nil
+	s.mu.Unlock()
+
+	return out, f, nil
 }
 
 // NewOut creates an output for manual writing within this session.
@@ -907,7 +927,6 @@ type managerConfig struct {
 	autoFileThreshold   int64
 	spillThreshold      *int64
 	maxPreallocateBytes *int64
-	useCopyBufPool      *bool
 	useMmap             *bool
 }
 
@@ -938,13 +957,6 @@ func (t maxPreallocateOption) applyOut(o *OutConfig) { o.maxPreallocateBytes = p
 // Set to 0 to disable the cap.
 func WithMaxPreallocate(bytes int64) maxPreallocateOption { return maxPreallocateOption(bytes) }
 
-type copyBufPoolOption bool
-
-func (t copyBufPoolOption) applyManager(c *managerConfig) { c.useCopyBufPool = ptrBool(bool(t)) }
-
-// WithCopyBufferPool enables or disables the shared copy buffer pool.
-func WithCopyBufferPool(enabled bool) copyBufPoolOption { return copyBufPoolOption(enabled) }
-
 type mmapOption bool
 
 func (t mmapOption) applyManager(c *managerConfig) { c.useMmap = ptrBool(bool(t)) }
@@ -960,7 +972,6 @@ type manager struct {
 	autoFileThreshold   int64
 	spillThreshold      int64
 	maxPreallocateBytes int64
-	useCopyBufPool      bool
 	useMmap             bool
 }
 
@@ -979,10 +990,6 @@ func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption
 	if config.maxPreallocateBytes != nil {
 		maxPreallocate = *config.maxPreallocateBytes
 	}
-	useCopyBufPool := true
-	if config.useCopyBufPool != nil {
-		useCopyBufPool = *config.useCopyBufPool
-	}
 	useMmap := false
 	if config.useMmap != nil {
 		useMmap = *config.useMmap
@@ -999,7 +1006,6 @@ func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption
 			autoFileThreshold:   config.autoFileThreshold,
 			spillThreshold:      spill,
 			maxPreallocateBytes: maxPreallocate,
-			useCopyBufPool:      useCopyBufPool,
 			useMmap:             useMmap,
 		}, nil
 	}
@@ -1015,7 +1021,6 @@ func NewIoManager(baseDir string, storageType StorageType, opts ...ManagerOption
 		autoFileThreshold:   config.autoFileThreshold,
 		spillThreshold:      spill,
 		maxPreallocateBytes: maxPreallocate,
-		useCopyBufPool:      useCopyBufPool,
 		useMmap:             useMmap,
 	}, nil
 }
@@ -1040,7 +1045,6 @@ func (m *manager) NewSession() (IoSession, error) {
 		autoFileThreshold:   m.autoFileThreshold,
 		spillThreshold:      m.spillThreshold,
 		maxPreallocateBytes: m.maxPreallocateBytes,
-		useCopyBufPool:      m.useCopyBufPool,
 		useMmap:             m.useMmap,
 	}, nil
 }
@@ -1817,33 +1821,20 @@ func Copy(ctx context.Context, src Source, out OutConfig) (*Output, error) {
 			return output, nil
 		}
 		if storageType == File {
-			output, err := iSes.newOutput(out.ext, File)
+			output, f, err := iSes.newOutputWithFile(out.ext, File)
 			if err != nil {
 				return nil, err
 			}
-			f, err := os.OpenFile(output.path, os.O_WRONLY|os.O_TRUNC, 0o600)
-			if err != nil {
+			// Write directly to the open file handle
+			_, writeErr := f.Write(b)
+			closeErr := f.Close()
+			if writeErr != nil {
 				_ = output.cleanup()
-				return nil, err
+				return nil, writeErr
 			}
-			if len(b) > 0 {
-				n, err := f.Write(b)
-				if err != nil {
-					_ = f.Close()
-					_ = output.cleanup()
-					return nil, err
-				}
-				if n < len(b) {
-					if _, err := writeAll(f, b[n:]); err != nil {
-						_ = f.Close()
-						_ = output.cleanup()
-						return nil, err
-					}
-				}
-			}
-			if err := f.Close(); err != nil {
+			if closeErr != nil {
 				_ = output.cleanup()
-				return nil, err
+				return nil, closeErr
 			}
 			return output, nil
 		}
@@ -1852,6 +1843,18 @@ func Copy(ctx context.Context, src Source, out OutConfig) (*Output, error) {
 	// Fast path: pathSource (file) - direct copy without lazy writer
 	if ps, ok := src.(pathSource); ok {
 		srcPath := string(ps)
+
+		// Quick check: if session and out config both default to File, skip stat
+		sessionStorageType := iSes.storageType
+		if out.storageType != nil {
+			sessionStorageType = *out.storageType
+		}
+		if sessionStorageType == File && iSes.autoFileThreshold <= 0 && out.autoFileThreshold == nil {
+			// Fast path: file → file (uses sendfile/copy_file_range syscall)
+			return copyFileToFile(iSes, out, srcPath)
+		}
+
+		// Need size for auto-threshold decisions
 		size := SizeFromStream(ps)
 		storageType := resolveStorageType(out, iSes, size)
 
@@ -1868,8 +1871,6 @@ func Copy(ctx context.Context, src Source, out OutConfig) (*Output, error) {
 
 	return copyViaDoOut(ctx, src, out)
 }
-
-// CopyAndClose copies into an Output, runs fn, then always cleans up the Output.
 
 // sliceWriter wraps a byte slice to implement io.Writer and io.ReaderFrom
 type sliceWriter struct {
@@ -1892,30 +1893,6 @@ func (w *sliceWriter) ReadFrom(r io.Reader) (int64, error) {
 	}
 	return int64(n), err
 }
-
-func writeAll(w io.Writer, b []byte) (int, error) {
-	written := 0
-	for len(b) > 0 {
-		n, err := w.Write(b)
-		written += n
-		if err != nil {
-			return written, err
-		}
-		if n == 0 {
-			return written, io.ErrShortWrite
-		}
-		b = b[n:]
-	}
-	return written, nil
-}
-
-type noWriteTo struct{ r io.Reader }
-
-func (n noWriteTo) Read(p []byte) (int, error) { return n.r.Read(p) }
-
-type noReadFrom struct{ w io.Writer }
-
-func (n noReadFrom) Write(p []byte) (int, error) { return n.w.Write(p) }
 
 func copyFileToMemory(iSes *ioSession, out OutConfig, srcPath string, size int64) (*Output, error) {
 	output, err := iSes.newOutput(out.ext, Memory)
@@ -1976,53 +1953,29 @@ func copyFileToMemory(iSes *ioSession, out OutConfig, srcPath string, size int64
 }
 
 func copyFileToFile(iSes *ioSession, out OutConfig, srcPath string) (*Output, error) {
-	output, err := iSes.newOutput(out.ext, File)
+	output, dstFile, err := iSes.newOutputWithFile(out.ext, File)
 	if err != nil {
 		return nil, err
-	}
-
-	if iSes != nil && iSes.useCopyBufPool {
-		if fi, err := os.Stat(srcPath); err == nil {
-			size := fi.Size()
-			if size >= 0 && size <= smallFileCopyThreshold {
-				data, err := os.ReadFile(srcPath)
-				if err != nil {
-					_ = output.cleanup()
-					return nil, err
-				}
-				if err := os.WriteFile(output.path, data, 0o600); err != nil {
-					_ = output.cleanup()
-					return nil, err
-				}
-				return output, nil
-			}
-		}
 	}
 
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
+		_ = dstFile.Close()
 		_ = output.cleanup()
 		return nil, err
 	}
-	defer srcFile.Close()
 
-	dstFile, err := os.Create(output.path)
+	// Use direct io.Copy to leverage copy_file_range syscall on supported platforms
+	_, err = io.Copy(dstFile, srcFile)
+	_ = srcFile.Close()
+	closeErr := dstFile.Close()
 	if err != nil {
 		_ = output.cleanup()
 		return nil, err
 	}
-	defer dstFile.Close()
-
-	if iSes != nil && iSes.useCopyBufPool {
-		buf := copyBufPool.Get().([]byte)
-		defer copyBufPool.Put(buf)
-		_, err = io.CopyBuffer(noReadFrom{w: dstFile}, noWriteTo{r: srcFile}, buf)
-	} else {
-		_, err = io.Copy(dstFile, srcFile)
-	}
-	if err != nil {
+	if closeErr != nil {
 		_ = output.cleanup()
-		return nil, err
+		return nil, closeErr
 	}
 
 	return output, nil
