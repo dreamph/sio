@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/dreamph/sio"
@@ -153,13 +154,10 @@ func benchFioDo(b *testing.B, size int, src sourceFactory, mgr fio.IoManager) {
 	ctx := fio.WithSession(context.Background(), ses)
 
 	for i := 0; i < b.N; i++ {
-		out, err := fio.DoOut(ctx, fio.Out(fio.Txt), func(ctx context.Context, s *fio.OutScope, w io.Writer) error {
-			r, _ := s.UseSized(src.makeFio())
-			_, err := io.Copy(w, r)
-			return err
-		})
+		// Use fio.Copy to leverage fast paths for bytes/file sources
+		out, err := fio.Copy(ctx, src.makeFio(), fio.Out(fio.Txt))
 		if err != nil {
-			b.Fatalf("DoOut: %v", err)
+			b.Fatalf("Copy: %v", err)
 		}
 		_ = out
 	}
@@ -194,6 +192,9 @@ func benchSioDo(b *testing.B, size int, src sourceFactory, mgr sio.IoManager) {
 }
 
 func BenchmarkCompareFioSio(b *testing.B) {
+	useMmap := envBool("FIO_BENCH_USE_MMAP", false)
+	useCopyBufPool := envBool("FIO_BENCH_USE_COPYBUFPOOL", false)
+
 	opsPerSessionList := []int{1}
 	sizes := []int{
 		1 << 10,   // 1KB
@@ -220,6 +221,8 @@ func BenchmarkCompareFioSio(b *testing.B) {
 			fio.WithMaxPreallocate(0),
 			fio.WithSpillThreshold(0),
 			fio.WithThreshold(0),
+			fio.WithMmap(useMmap),
+			fio.WithCopyBufferPool(useCopyBufPool),
 		)
 		if err != nil {
 			b.Fatalf("NewIoManager(fio): %v", err)
@@ -266,5 +269,20 @@ func BenchmarkCompareFioSio(b *testing.B) {
 				}
 			}
 		}
+	}
+}
+
+func envBool(name string, def bool) bool {
+	val := os.Getenv(name)
+	if val == "" {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return def
 	}
 }
