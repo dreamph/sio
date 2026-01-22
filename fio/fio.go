@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -667,7 +668,7 @@ type ioSession struct {
 	mu                  sync.Mutex
 	manager             IoManager
 	dir                 string
-	closed              bool
+	closed              atomic.Bool
 	outputs             []*Output
 	cleanupFns          []func() error
 	storageType         StorageType
@@ -713,9 +714,7 @@ func (s *ioSession) Dir() string {
 }
 
 func (s *ioSession) ensureOpen() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return ErrIoSessionClosed
 	}
 	return nil
@@ -729,9 +728,8 @@ func (s *ioSession) newOutput(ext string, storageType StorageType) (*Output, err
 // newOutputWithFile creates an output and returns the open file handle for File storage.
 // The caller is responsible for closing the file. For Memory storage, file is nil.
 func (s *ioSession) newOutputWithFile(ext string, storageType StorageType) (*Output, *os.File, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	// Fast check without lock
+	if s.closed.Load() {
 		return nil, nil, ErrIoSessionClosed
 	}
 
@@ -741,13 +739,17 @@ func (s *ioSession) newOutputWithFile(ext string, storageType StorageType) (*Out
 			storageType:         Memory,
 			maxPreallocateBytes: s.maxPreallocateBytes,
 		}
+		s.mu.Lock()
+		if s.closed.Load() {
+			s.mu.Unlock()
+			return nil, nil, ErrIoSessionClosed
+		}
 		s.outputs = append(s.outputs, out)
 		s.mu.Unlock()
 		return out, nil, nil
 	}
 
 	if s.dir == "" {
-		s.mu.Unlock()
 		return nil, nil, ErrFileStorageUnavailable
 	}
 
@@ -755,12 +757,9 @@ func (s *ioSession) newOutputWithFile(ext string, storageType StorageType) (*Out
 	if ext != "" {
 		pattern += ext
 	}
-	dir := s.dir
-	maxPreallocate := s.maxPreallocateBytes
-	s.mu.Unlock()
 
 	// CreateTemp outside of lock to reduce lock contention
-	f, err := os.CreateTemp(dir, pattern)
+	f, err := os.CreateTemp(s.dir, pattern)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -769,11 +768,11 @@ func (s *ioSession) newOutputWithFile(ext string, storageType StorageType) (*Out
 		path:                f.Name(),
 		ses:                 s,
 		storageType:         File,
-		maxPreallocateBytes: maxPreallocate,
+		maxPreallocateBytes: s.maxPreallocateBytes,
 	}
 
 	s.mu.Lock()
-	if s.closed {
+	if s.closed.Load() {
 		s.mu.Unlock()
 		_ = f.Close()
 		_ = os.Remove(f.Name())
@@ -824,13 +823,10 @@ func (s *ioSession) isKeptPath(path string) bool {
 }
 
 func (s *ioSession) Cleanup() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	// Use atomic swap to ensure only one cleanup runs
+	if s.closed.Swap(true) {
 		return nil
 	}
-	s.closed = true
-	s.mu.Unlock()
 
 	var errs error
 
