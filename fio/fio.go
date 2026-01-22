@@ -266,7 +266,7 @@ type Input struct {
 	// Reusable support
 	reusable   bool
 	needsReset bool
-	ra         io.ReaderAt // reusable file
+	readerAt   io.ReaderAt // reusable file
 	data       []byte      // reusable memory
 }
 
@@ -283,7 +283,7 @@ func (in *Input) Close() error {
 		errs = errors.Join(errs, in.cleanup())
 		in.cleanup = nil
 	}
-	in.ra = nil
+	in.readerAt = nil
 	in.data = nil
 	in.needsReset = false
 	return errs
@@ -301,8 +301,8 @@ func (in *Input) ReaderAt() io.ReaderAt {
 	if in == nil {
 		return nil
 	}
-	if in.ra != nil {
-		return in.ra
+	if in.readerAt != nil {
+		return in.readerAt
 	}
 	if in.data != nil {
 		return bytes.NewReader(in.data)
@@ -330,8 +330,8 @@ func (in *Input) Reset() error {
 		return nil
 	}
 
-	if in.ra != nil {
-		in.R = &readerAtCloser{r: io.NewSectionReader(in.ra, 0, in.Size)}
+	if in.readerAt != nil {
+		in.R = &readerAtCloser{r: io.NewSectionReader(in.readerAt, 0, in.Size)}
 		in.needsReset = false
 		return nil
 	}
@@ -426,7 +426,7 @@ func makeReusableFile(in *Input, f *os.File) (*Input, error) {
 		return makeReusable(in)
 	}
 
-	in.ra = f
+	in.readerAt = f
 	in.Size = size
 	in.reusable = true
 	in.needsReset = false
@@ -442,13 +442,13 @@ func makeReusableFile(in *Input, f *os.File) (*Input, error) {
 type Output struct {
 	mu                  sync.Mutex
 	path                string
-	ses                 IoSession
+	session             IoSession
 	closed              bool
 	keep                bool
 	data                []byte
 	storageType         StorageType
 	maxPreallocateBytes int64
-	cleanupFn           func() error
+	cleanupFunc         func() error
 }
 
 func (o *Output) Path() string {
@@ -592,9 +592,9 @@ func (o *Output) cleanup() error {
 	o.closed = true
 
 	if o.storageType == Memory {
-		if o.cleanupFn != nil {
-			_ = o.cleanupFn()
-			o.cleanupFn = nil
+		if o.cleanupFunc != nil {
+			_ = o.cleanupFunc()
+			o.cleanupFunc = nil
 		}
 		o.data = nil
 		return nil
@@ -612,20 +612,20 @@ func (o *Output) cleanup() error {
 /* -------------------------------------------------------------------------- */
 
 type OutHandle struct {
-	W       io.WriteCloser
-	output  *Output
-	session *ioSession
-	done    bool
+	W         io.WriteCloser
+	output    *Output
+	session   *ioSession
+	finalized bool
 }
 
 func (h *OutHandle) Finalize() (*Output, error) {
 	if h == nil {
 		return nil, ErrNilOutHandle
 	}
-	if h.done {
+	if h.finalized {
 		return h.output, nil
 	}
-	h.done = true
+	h.finalized = true
 
 	if h.W != nil {
 		if err := h.W.Close(); err != nil {
@@ -640,10 +640,10 @@ func (h *OutHandle) Finalize() (*Output, error) {
 }
 
 func (h *OutHandle) Cleanup() error {
-	if h == nil || h.done {
+	if h == nil || h.finalized {
 		return nil
 	}
-	h.done = true
+	h.finalized = true
 
 	var errs error
 	if h.W != nil {
@@ -735,7 +735,7 @@ func (s *ioSession) newOutputWithFile(ext string, storageType StorageType) (*Out
 
 	if storageType == Memory {
 		out := &Output{
-			ses:                 s,
+			session:             s,
 			storageType:         Memory,
 			maxPreallocateBytes: s.maxPreallocateBytes,
 		}
@@ -766,7 +766,7 @@ func (s *ioSession) newOutputWithFile(ext string, storageType StorageType) (*Out
 
 	out := &Output{
 		path:                f.Name(),
-		ses:                 s,
+		session:             s,
 		storageType:         File,
 		maxPreallocateBytes: s.maxPreallocateBytes,
 	}
@@ -1093,7 +1093,7 @@ type OutConfig struct {
 	spillThreshold      *int64
 	maxPreallocateBytes *int64
 	reusePtr            **Output
-	reuseCfg            outReuseCfg
+	reuseCfg            outReuseConfig
 	reuseEnabled        bool
 }
 
@@ -1113,7 +1113,7 @@ func OutReuse(outPtr **Output, opts ...OutReuseOpt) OutOption {
 	return OutOptionFunc(func(o *OutConfig) {
 		o.reusePtr = outPtr
 		o.reuseEnabled = true
-		cfg := outReuseCfg{cleanupOld: true, keepMemCap: true, maxMemCap: 0}
+		cfg := outReuseConfig{cleanupOld: true, keepMemCap: true, maxMemCap: 0}
 		for _, opt := range opts {
 			if opt != nil {
 				opt.applyOutReuse(&cfg)
@@ -1533,27 +1533,27 @@ func (s *OutScope) finalizeOut(fnErr error) (*Output, error) {
 /* -------------------------------------------------------------------------- */
 
 type OutReuseOpt interface {
-	applyOutReuse(*outReuseCfg)
+	applyOutReuse(*outReuseConfig)
 }
 
-type OutReuseOptFunc func(*outReuseCfg)
+type OutReuseOptFunc func(*outReuseConfig)
 
-func (f OutReuseOptFunc) applyOutReuse(c *outReuseCfg) { f(c) }
+func (f OutReuseOptFunc) applyOutReuse(c *outReuseConfig) { f(c) }
 
-type outReuseCfg struct {
+type outReuseConfig struct {
 	cleanupOld bool // default true
 	keepMemCap bool // default true
 	maxMemCap  int64
 }
 
 func WithCleanupOld(v bool) OutReuseOpt {
-	return OutReuseOptFunc(func(c *outReuseCfg) { c.cleanupOld = v })
+	return OutReuseOptFunc(func(c *outReuseConfig) { c.cleanupOld = v })
 }
 func WithKeepMemCap(v bool) OutReuseOpt {
-	return OutReuseOptFunc(func(c *outReuseCfg) { c.keepMemCap = v })
+	return OutReuseOptFunc(func(c *outReuseConfig) { c.keepMemCap = v })
 }
 func WithMaxMemCap(bytes int64) OutReuseOpt {
-	return OutReuseOptFunc(func(c *outReuseCfg) { c.maxMemCap = bytes })
+	return OutReuseOptFunc(func(c *outReuseConfig) { c.maxMemCap = bytes })
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1563,7 +1563,7 @@ func WithMaxMemCap(bytes int64) OutReuseOpt {
 type memWriteCloser struct {
 	buf    *bytes.Buffer
 	output *Output
-	cfg    outReuseCfg
+	cfg    outReuseConfig
 }
 
 func (w *memWriteCloser) Write(p []byte) (int, error) { return w.buf.Write(p) }
@@ -1610,9 +1610,9 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 		return errWriter{err}
 	}
 	outPtr := cfg.reusePtr
-	rcfg := cfg.reuseCfg
+	reuseCfg := cfg.reuseCfg
 	if !cfg.reuseEnabled {
-		rcfg = outReuseCfg{cleanupOld: true, keepMemCap: true, maxMemCap: 0}
+		reuseCfg = outReuseConfig{cleanupOld: true, keepMemCap: true, maxMemCap: 0}
 	}
 
 	ses := Session(s.ctx)
@@ -1638,7 +1638,7 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 	}
 
 	prev := *outPtr
-	if prev != nil && rcfg.cleanupOld && prev.StorageType() != storageType {
+	if prev != nil && reuseCfg.cleanupOld && prev.StorageType() != storageType {
 		_ = prev.cleanup()
 		prev = nil
 		*outPtr = nil
@@ -1676,18 +1676,18 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 		out.mu.Unlock()
 
 		var buf *bytes.Buffer
-		if rcfg.keepMemCap && cap(old) > 0 {
+		if reuseCfg.keepMemCap && cap(old) > 0 {
 			buf = bytes.NewBuffer(old[:0])
 		} else {
 			buf = &bytes.Buffer{}
 		}
 
-		wc := &memWriteCloser{buf: buf, output: out, cfg: rcfg}
+		wc := &memWriteCloser{buf: buf, output: out, cfg: reuseCfg}
 		s.outHandle = &OutHandle{W: wc, output: out, session: iSes}
 		return wc
 
 	default: // File
-		if prev != nil && prev.StorageType() == File && rcfg.cleanupOld {
+		if prev != nil && prev.StorageType() == File && reuseCfg.cleanupOld {
 			_ = prev.cleanup()
 			newOut, err := iSes.newOutput(cfg.ext, File)
 			if err != nil {
@@ -1907,7 +1907,7 @@ func copyFileToMemory(iSes *ioSession, out OutConfig, srcPath string, size int64
 		if data, cleanup, ok := tryMmap(f, size); ok {
 			output.mu.Lock()
 			output.data = data
-			output.cleanupFn = cleanup
+			output.cleanupFunc = cleanup
 			output.mu.Unlock()
 			return output, nil
 		}
@@ -2320,9 +2320,9 @@ type DownloadReaderCloser interface {
 }
 
 type downloadReaderCloser struct {
-	reader  io.ReadCloser
-	cleanup func() error
-	extra   func()
+	reader            io.ReadCloser
+	cleanup           func() error
+	additionalCleanup func()
 }
 
 func (d *downloadReaderCloser) Read(p []byte) (int, error) {
@@ -2345,9 +2345,9 @@ func (d *downloadReaderCloser) Close() error {
 		d.cleanup = nil
 	}
 
-	if d.extra != nil {
-		d.extra()
-		d.extra = nil
+	if d.additionalCleanup != nil {
+		d.additionalCleanup()
+		d.additionalCleanup = nil
 	}
 
 	return errs
@@ -2370,7 +2370,7 @@ func NewDownloadReaderCloser(src Source, cleanup ...func()) (DownloadReaderClose
 	}
 
 	if len(cleanup) > 0 {
-		d.extra = cleanup[0]
+		d.additionalCleanup = cleanup[0]
 	}
 
 	return d, nil
