@@ -1949,15 +1949,15 @@ func copyFileToMemory(iSes *ioSession, out OutConfig, srcPath string, size int64
 }
 
 func copyFileToFile(iSes *ioSession, out OutConfig, srcPath string) (*Output, error) {
-	output, dstFile, err := iSes.newOutputWithFile(out.ext, File)
+	// Open source file first to fail fast if it doesn't exist
+	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return nil, err
 	}
 
-	srcFile, err := os.Open(srcPath)
+	output, dstFile, err := iSes.newOutputWithFile(out.ext, File)
 	if err != nil {
-		_ = dstFile.Close()
-		_ = output.cleanup()
+		_ = srcFile.Close()
 		return nil, err
 	}
 
