@@ -199,11 +199,11 @@ input, _ := fio.OpenIn(ctx, fio.PathSource("data.txt"), fio.Reusable())
 defer input.Close()
 
 // First read
-io.Copy(w1, input.R)
+io.Copy(w1, input.Reader)
 
 // Reset and read again
 input.Reset()
-io.Copy(w2, input.R)
+io.Copy(w2, input.Reader)
 ```
 
 ## ReaderAt Conversion

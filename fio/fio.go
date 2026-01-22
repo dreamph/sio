@@ -247,7 +247,7 @@ func (s inputSource) open(ctx context.Context) (io.ReadCloser, func() error, int
 	if s.in == nil {
 		return nil, nil, -1, "", "", ErrNilSource
 	}
-	return s.in.R, s.in.Close, s.in.Size, s.in.Kind, s.in.Path, nil
+	return s.in.Reader, s.in.Close, s.in.Size, s.in.Kind, s.in.Path, nil
 }
 
 /* -------------------------------------------------------------------------- */
@@ -257,7 +257,7 @@ func (s inputSource) open(ctx context.Context) (io.ReadCloser, func() error, int
 // Input represents an opened input source with metadata.
 // Supports reusable reset (optional).
 type Input struct {
-	R       io.ReadCloser
+	Reader  io.ReadCloser
 	Size    int64
 	Kind    string
 	Path    string
@@ -275,9 +275,9 @@ func (in *Input) Close() error {
 		return nil
 	}
 	var errs error
-	if in.R != nil {
-		errs = errors.Join(errs, in.R.Close())
-		in.R = nil
+	if in.Reader != nil {
+		errs = errors.Join(errs, in.Reader.Close())
+		in.Reader = nil
 	}
 	if in.cleanup != nil {
 		errs = errors.Join(errs, in.cleanup())
@@ -307,7 +307,7 @@ func (in *Input) ReaderAt() io.ReaderAt {
 	if in.data != nil {
 		return bytes.NewReader(in.data)
 	}
-	if ra, ok := in.R.(io.ReaderAt); ok {
+	if ra, ok := in.Reader.(io.ReaderAt); ok {
 		return ra
 	}
 	return nil
@@ -325,18 +325,18 @@ func (in *Input) Reset() error {
 	}
 
 	if in.data != nil {
-		in.R = io.NopCloser(bytes.NewReader(in.data))
+		in.Reader = io.NopCloser(bytes.NewReader(in.data))
 		in.needsReset = false
 		return nil
 	}
 
 	if in.readerAt != nil {
-		in.R = &readerAtCloser{r: io.NewSectionReader(in.readerAt, 0, in.Size)}
+		in.Reader = &readerAtCloser{r: io.NewSectionReader(in.readerAt, 0, in.Size)}
 		in.needsReset = false
 		return nil
 	}
 
-	if seeker, ok := in.R.(io.Seeker); ok {
+	if seeker, ok := in.Reader.(io.Seeker); ok {
 		_, err := seeker.Seek(0, io.SeekStart)
 		if err == nil {
 			in.needsReset = false
@@ -382,7 +382,7 @@ func OpenIn(ctx context.Context, src Source, opts ...InOption) (*Input, error) {
 		return nil, err
 	}
 
-	in := &Input{R: rc, Size: size, Kind: kind, Path: path, cleanup: cleanup}
+	in := &Input{Reader: rc, Size: size, Kind: kind, Path: path, cleanup: cleanup}
 
 	if cfg.reusable {
 		return makeReusable(in)
@@ -398,18 +398,18 @@ func makeReusable(in *Input) (*Input, error) {
 		return in, nil
 	}
 
-	if f, ok := in.R.(*os.File); ok {
+	if f, ok := in.Reader.(*os.File); ok {
 		return makeReusableFile(in, f)
 	}
 
-	data, err := io.ReadAll(in.R)
+	data, err := io.ReadAll(in.Reader)
 	if err != nil {
 		_ = in.Close()
 		return nil, err
 	}
-	_ = in.R.Close()
+	_ = in.Reader.Close()
 
-	in.R = io.NopCloser(bytes.NewReader(data))
+	in.Reader = io.NopCloser(bytes.NewReader(data))
 	in.Size = int64(len(data))
 	in.data = data
 	in.reusable = true
@@ -430,7 +430,7 @@ func makeReusableFile(in *Input, f *os.File) (*Input, error) {
 	in.Size = size
 	in.reusable = true
 	in.needsReset = false
-	in.R = &readerAtCloser{r: io.NewSectionReader(f, 0, size)}
+	in.Reader = &readerAtCloser{r: io.NewSectionReader(f, 0, size)}
 	in.cleanup = f.Close
 	return in, nil
 }
@@ -612,7 +612,7 @@ func (o *Output) cleanup() error {
 /* -------------------------------------------------------------------------- */
 
 type OutHandle struct {
-	W         io.WriteCloser
+	Writer    io.WriteCloser
 	output    *Output
 	session   *ioSession
 	finalized bool
@@ -627,8 +627,8 @@ func (h *OutHandle) Finalize() (*Output, error) {
 	}
 	h.finalized = true
 
-	if h.W != nil {
-		if err := h.W.Close(); err != nil {
+	if h.Writer != nil {
+		if err := h.Writer.Close(); err != nil {
 			if h.output != nil {
 				_ = h.output.cleanup()
 			}
@@ -646,8 +646,8 @@ func (h *OutHandle) Cleanup() error {
 	h.finalized = true
 
 	var errs error
-	if h.W != nil {
-		errs = errors.Join(errs, h.W.Close())
+	if h.Writer != nil {
+		errs = errors.Join(errs, h.Writer.Close())
 	}
 	if h.output != nil {
 		errs = errors.Join(errs, h.output.cleanup())
@@ -1247,7 +1247,7 @@ func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, 
 		return nil, err
 	}
 
-	return &OutHandle{W: w, output: output, session: iSes}, nil
+	return &OutHandle{Writer: w, output: output, session: iSes}, nil
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1285,7 +1285,7 @@ func (s *Scope) Use(src Source) io.Reader {
 			return errReader{err}
 		}
 		is.in.markUsed()
-		return is.in.R
+		return is.in.Reader
 	}
 
 	rc, cleanup, _, _, _, err := src.open(s.ctx)
@@ -1324,7 +1324,7 @@ func (s *Scope) UseSized(src Source) (io.Reader, int64) {
 			return errReader{err}, -1
 		}
 		is.in.markUsed()
-		return is.in.R, is.in.Size
+		return is.in.Reader, is.in.Size
 	}
 
 	rc, cleanup, size, _, _, err := src.open(s.ctx)
@@ -1476,7 +1476,7 @@ func (w *lazyOutWriter) ReadFrom(r io.Reader) (int64, error) {
 
 func (s *OutScope) ensureOutWriter() io.Writer {
 	if s.outHandle != nil {
-		return s.outHandle.W
+		return s.outHandle.Writer
 	}
 	hint := int64(-1)
 	if s.outSizeHintSet {
@@ -1504,7 +1504,7 @@ func (s *OutScope) NewOut(out OutConfig, sizeHint ...int64) io.Writer {
 	}
 
 	s.outHandle = oh
-	return oh.W
+	return oh.Writer
 }
 
 func (s *OutScope) finalizeOut(fnErr error) (*Output, error) {
@@ -1683,7 +1683,7 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 		}
 
 		wc := &memWriteCloser{buf: buf, output: out, cfg: reuseCfg}
-		s.outHandle = &OutHandle{W: wc, output: out, session: iSes}
+		s.outHandle = &OutHandle{Writer: wc, output: out, session: iSes}
 		return wc
 
 	default: // File
@@ -1705,7 +1705,7 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 			return errWriter{err}
 		}
 
-		s.outHandle = &OutHandle{W: w, output: out, session: iSes}
+		s.outHandle = &OutHandle{Writer: w, output: out, session: iSes}
 		return w
 	}
 }
