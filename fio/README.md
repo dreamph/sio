@@ -4,13 +4,46 @@ Package `fio` provides streaming I/O utilities with session management, automati
 
 ## Features
 
+- **Write Once, Dynamic Storage** - Same code works with memory or file storage; automatically switches based on data size
 - **Type-safe Sources** - Strongly typed input sources (files, URLs, bytes, readers, multipart)
 - **Session Management** - Automatic temp file cleanup via IoManager/IoSession
 - **Dual Storage Backends** - Memory or file-based storage with automatic spill-to-disk
 - **Reusable Inputs** - Reset and reuse input streams multiple times
 - **ReaderAt Conversion** - Convert any io.Reader to io.ReaderAt with memory/temp-file buffering
 - **Memory-mapped I/O** - Optional mmap support on Unix systems for fast file reading
-- **Buffer Pooling** - Shared copy buffers to reduce allocations
+
+## Why fio?
+
+**Write once, run with any storage backend.** Your code doesn't change whether data is stored in memory or files:
+
+```go
+// Same code - storage is determined by configuration, not code changes
+output, _ := fio.Copy(ctx, fio.PathSource("input.txt"), fio.Out(".txt"))
+
+// Read result the same way regardless of storage type
+data, _ := output.Bytes()      // works for both memory and file
+reader, _ := output.OpenReader() // works for both memory and file
+```
+
+**Automatic storage selection based on data size:**
+
+```go
+// Manager with auto-threshold: small data → memory, large data → file
+mgr, _ := fio.NewIoManager("./temp", fio.Memory,
+    fio.WithThreshold(10*1024*1024),  // Switch to file at 10MB
+)
+
+// Your code stays the same - fio decides storage automatically
+output, _ := fio.Copy(ctx, source, fio.Out(".json"))
+// 1KB file  → stored in memory
+// 50MB file → stored in temp file
+```
+
+**Benefits:**
+- No `if/else` for memory vs file handling
+- Automatic cleanup of temp files via session
+- Consistent API regardless of storage backend
+- Optimal performance for each scenario
 
 ## Installation
 
