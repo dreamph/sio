@@ -699,11 +699,11 @@ func resolveStorageType(out OutConfig, ses *ioSession, sizeHint int64) StorageTy
 }
 
 func resolveMaxPreallocate(out OutConfig, ses *ioSession) int64 {
-	max := ses.maxPreallocateBytes
+	maxValue := ses.maxPreallocateBytes
 	if out.maxPreallocateBytes != nil {
-		max = *out.maxPreallocateBytes
+		maxValue = *out.maxPreallocateBytes
 	}
-	return max
+	return maxValue
 }
 
 func (s *ioSession) Dir() string {
