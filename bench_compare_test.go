@@ -84,6 +84,67 @@ type nopWriteCloser struct{ io.Writer }
 
 func (n nopWriteCloser) Close() error { return nil }
 
+func benchNormalReadOnly(b *testing.B, size int, src sourceFactory) {
+	b.Helper()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		r, err := src.open()
+		if err != nil {
+			b.Fatalf("open: %v", err)
+		}
+
+		_, err = io.Copy(io.Discard, r)
+		_ = r.Close()
+		if err != nil {
+			b.Fatalf("copy: %v", err)
+		}
+	}
+}
+
+func benchFioReadOnly(b *testing.B, size int, src sourceFactory) {
+	b.Helper()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	ctx := context.Background()
+
+	for i := 0; i < b.N; i++ {
+		_, err := fio.Read(ctx, src.makeFio(), func(r io.Reader) (fio.Void, error) {
+			_, err := io.Copy(io.Discard, r)
+			return fio.Void{}, err
+		})
+		if err != nil {
+			b.Fatalf("Read: %v", err)
+		}
+	}
+}
+
+func benchSioReadOnly(b *testing.B, size int, src sourceFactory) {
+	b.Helper()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(size))
+	b.ResetTimer()
+
+	ctx := context.Background()
+
+	for i := 0; i < b.N; i++ {
+		err := sio.Read(ctx, src.makeSio(), func(ctx context.Context, r io.Reader) error {
+			_, err := io.Copy(io.Discard, r)
+			return err
+		})
+		if err != nil {
+			b.Fatalf("Read: %v", err)
+		}
+	}
+}
+
 func benchNormalCopy(b *testing.B, size int, storage string, src sourceFactory, opsPerSession int) {
 	b.Helper()
 
@@ -243,6 +304,27 @@ func BenchmarkCompareFioSio(b *testing.B) {
 	for _, size := range sizes {
 		data := bytes.Repeat([]byte{'a'}, size)
 		sizeLabel := strconv.Itoa(size)
+
+		// Read-only benchmarks (no output)
+		for _, sourceKind := range sourceKinds {
+			b.Run("normal/"+sourceKind+"/read-only/"+sizeLabel, func(b *testing.B) {
+				src := newSourceFactory(b, sourceKind, data)
+				defer src.cleanup()
+				benchNormalReadOnly(b, size, src)
+			})
+			b.Run("fio/"+sourceKind+"/read-only/"+sizeLabel, func(b *testing.B) {
+				src := newSourceFactory(b, sourceKind, data)
+				defer src.cleanup()
+				benchFioReadOnly(b, size, src)
+			})
+			b.Run("sio/"+sourceKind+"/read-only/"+sizeLabel, func(b *testing.B) {
+				src := newSourceFactory(b, sourceKind, data)
+				defer src.cleanup()
+				benchSioReadOnly(b, size, src)
+			})
+		}
+
+		// Copy benchmarks (with output)
 		for _, sourceKind := range sourceKinds {
 			for _, storage := range storages {
 				for _, opsPerSession := range opsPerSessionList {

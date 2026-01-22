@@ -469,13 +469,42 @@ Benchmark comparing `fio` and `normal` (standard library io.Copy) on Apple M2 Ma
 | **100MB** | normal | 44.0 ms | 2,385 MB/s | 33,717 B | 13 |  |
 |  | **fio** | **41.1 ms** | **2,553 MB/s** | 33,723 B | 17 | 🏆⚡ |
 
+### Bytes Source → Read Only (no output)
+
+| Size | Method | Speed | Throughput | Memory | Allocs | Notes |
+|------|--------|-------|------------|--------|--------|-------|
+| **1KB** | **normal** | **39.6 ns** | **25,862 MB/s** | **64 B** | **2** | ⚡💾 |
+| | fio | 65.0 ns | 15,755 MB/s | 136 B | 3 | |
+| **1MB** | **normal** | **43.5 ns** | **24.1 TB/s** | **64 B** | **2** | ⚡💾 zero-copy discard |
+| | fio | 72.3 ns | 14.5 TB/s | 136 B | 3 | |
+| **10MB** | **normal** | **41.0 ns** | **256 TB/s** | **64 B** | **2** | ⚡💾 zero-copy discard |
+| | fio | 68.1 ns | 154 TB/s | 136 B | 3 | |
+| **100MB** | **normal** | **39.9 ns** | **2.6 PB/s** | **64 B** | **2** | ⚡💾 zero-copy discard |
+| | fio | 66.2 ns | 1.6 PB/s | 136 B | 3 | |
+
+### File Source → Read Only (no output)
+
+| Size | Method | Speed | Throughput | Memory | Allocs | Notes |
+|------|--------|-------|------------|--------|--------|-------|
+| **1KB** | **normal** | **15.7 µs** | **65.1 MB/s** | **240 B** | **4** | ⚡💾 |
+| | fio | 16.5 µs | 62.1 MB/s | 553 B | 9 | |
+| **1MB** | **normal** | **98.6 µs** | **10,630 MB/s** | **240 B** | **4** | ⚡💾 |
+| | fio | 99.7 µs | 10,516 MB/s | 553 B | 9 | |
+| **10MB** | fio | 839 µs | 12,488 MB/s | 554 B | 9 | ⚡ |
+| | **normal** | 844 µs | 12,424 MB/s | **244 B** | **4** | 💾 |
+| **100MB** | **normal** | **11.1 ms** | **9,407 MB/s** | **245 B** | **4** | 💾 |
+| | fio | 11.5 ms | 9,100 MB/s | 583 B | 9 | |
+
 ### Summary
+
 | Scenario | Winner | Why |
 |----------|--------|-----|
 | **bytes → memory** | 🏆 **fio** | Zero-copy, fastest in all sizes, minimal memory |
 | **bytes → file** | 🏆 **fio** | Faster at 1MB/10MB/100MB (28-41% faster); slightly slower at 1KB |
 | **file → memory** | 🏆 **fio** | Faster for all sizes with 50% less memory |
 | **file → file** | **mixed** | normal faster at small sizes (4-12%); fio faster at 100MB (7%) |
+| **bytes → read-only** | **normal** | Both near-instant; fio has minimal overhead (~1.6x) |
+| **file → read-only** | **~equal** | Comparable performance; fio slightly more allocations |
 
 ### Key Takeaways
 
@@ -483,6 +512,8 @@ Benchmark comparing `fio` and `normal` (standard library io.Copy) on Apple M2 Ma
 2. **fio bytes→file is optimized** - 28-41% faster than normal for 1MB+ files
 3. **fio file→memory is efficient** - 7x faster at 1MB with 50% less memory
 4. **file→file is competitive** - fio slightly slower at small files (~10%), faster at large files
+5. **read-only is near-instant for bytes** - both normal and fio use zero-copy to io.Discard
+6. **file read-only is I/O bound** - ~10-12 GB/s throughput, both methods comparable
 
 ### Run Benchmarks
 
