@@ -380,82 +380,83 @@ if errors.Is(err, fio.ErrDownloadFailed) {
 
 ## Benchmark Comparison
 Benchmark comparing `fio` and `normal` (standard library io.Copy) on Apple M2 Max.
+
 ### Legend
 | Symbol | Meaning |
 |--------|---------|
 | ⚡ | Fastest speed |
 | 💾 | Lowest memory |
 | 🏆 | Best overall |
+
 ### Bytes Source → Memory Storage
 | Size | Method | Speed | Throughput | Memory | Allocs | Notes |
 |------|--------|-------|------------|--------|--------|-------|
-| **1KB** | normal | 195 ns | 5,259 MB/s | 1,152 B | 5 | copies data |
-|  | **fio** | **135 ns** | **7,567 MB/s** | **249 B** | **3** | 🏆⚡💾 zero-copy |
-| **1MB** | normal | 92.8 µs | 11,304 MB/s | 1.0 MB | 5 | copies data |
-|  | **fio** | **145 ns** | **7,244,530 MB/s** | **244 B** | **3** | 🏆⚡💾 zero-copy |
-| **10MB** | normal | 436.5 µs | 24,021 MB/s | 10 MB | 5 | copies data |
-|  | **fio** | **149 ns** | **70,581,965 MB/s** | **240 B** | **3** | 🏆⚡💾 zero-copy |
-| **100MB** | normal | 3.58 ms | 29,281 MB/s | 100 MB | 5 | copies data |
-|  | **fio** | **142 ns** | **740,346,343 MB/s** | **245 B** | **3** | 🏆⚡💾 zero-copy |
+| **1KB** | normal | 201 ns | 5,084 MB/s | 1,152 B | 5 | copies data |
+|  | **fio** | **130 ns** | **7,865 MB/s** | **249 B** | **3** | 🏆⚡💾 zero-copy |
+| **1MB** | normal | 115 µs | 9,139 MB/s | 1.0 MB | 5 | copies data |
+|  | **fio** | **137 ns** | **7,655,321 MB/s** | **241 B** | **3** | 🏆⚡💾 zero-copy |
+| **10MB** | normal | 604 µs | 17,362 MB/s | 10 MB | 5 | copies data |
+|  | **fio** | **144 ns** | **72,978,112 MB/s** | **241 B** | **3** | 🏆⚡💾 zero-copy |
+| **100MB** | normal | 3.61 ms | 29,010 MB/s | 100 MB | 5 | copies data |
+|  | **fio** | **133 ns** | **788,153,403 MB/s** | **240 B** | **3** | 🏆⚡💾 zero-copy |
 
 ### Bytes Source → File Storage
 | Size | Method | Speed | Throughput | Memory | Allocs | Notes |
 |------|--------|-------|------------|--------|--------|-------|
-| **1KB** | **normal** | **116.5 µs** | **8.8 MB/s** | 744 B | 9 | ⚡ |
-|  | **fio** | 137.3 µs | 7.5 MB/s | **722 B** | **11** | 💾 |
-| **1MB** | normal | 423.9 µs | 2,474 MB/s | 744 B | 9 |  |
-|  | **fio** | **346.9 µs** | **3,023 MB/s** | **722 B** | **11** | 🏆⚡💾 |
-| **10MB** | **normal** | **2.89 ms** | **3,629 MB/s** | 752 B | 9 | ⚡ |
-|  | **fio** | 3.27 ms | 3,210 MB/s | **708 B** | **11** | 💾 |
-| **100MB** | **normal** | **25.72 ms** | **4,077 MB/s** | 805 B | 9 | ⚡ |
-|  | **fio** | 38.20 ms | 2,745 MB/s | **725 B** | **11** | 💾 |
+| **1KB** | **normal** | **117 µs** | **8.7 MB/s** | 743 B | 9 | ⚡ |
+|  | fio | 139 µs | 7.4 MB/s | **727 B** | 11 | 💾 |
+| **1MB** | normal | 379 µs | 2,765 MB/s | 744 B | 9 |  |
+|  | **fio** | **268 µs** | **3,914 MB/s** | **720 B** | **11** | 🏆⚡💾 |
+| **10MB** | normal | 2.80 ms | 3,751 MB/s | 746 B | 9 |  |
+|  | **fio** | **2.18 ms** | **4,818 MB/s** | **709 B** | **11** | 🏆⚡💾 |
+| **100MB** | normal | 23.1 ms | 4,540 MB/s | 781 B | 9 |  |
+|  | **fio** | **22.8 ms** | **4,591 MB/s** | **718 B** | **11** | 🏆⚡💾 |
 
 ### File Source → Memory Storage
 | Size | Method | Speed | Throughput | Memory | Allocs | Notes |
 |------|--------|-------|------------|--------|--------|-------|
-| **1KB** | normal | 19.3 µs | 53.1 MB/s | 34,096 B | 8 |  |
-|  | **fio** | **16.9 µs** | **60.7 MB/s** | **1,958 B** | **13** | 🏆⚡💾 |
-| **1MB** | normal | 463.0 µs | 2,265 MB/s | 2.0 MB | 13 |  |
-|  | **fio** | **119.8 µs** | **8,754 MB/s** | **1.0 MB** | **13** | 🏆⚡💾 |
-| **10MB** | normal | 2.27 ms | 4,612 MB/s | 32 MB | 17 |  |
-|  | **fio** | **1.08 ms** | **9,690 MB/s** | **10 MB** | **13** | 🏆⚡💾 |
-| **100MB** | **normal** | **16.26 ms** | **6,449 MB/s** | 256 MB | 20 | ⚡ |
-|  | **fio** | 17.96 ms | 5,839 MB/s | **100 MB** | **13** | 💾 |
+| **1KB** | normal | 20.7 µs | 49.4 MB/s | 34,096 B | 8 |  |
+|  | **fio** | **17.9 µs** | **57.2 MB/s** | **1,965 B** | **13** | 🏆⚡💾 |
+| **1MB** | normal | 797 µs | 1,315 MB/s | 2.0 MB | 13 |  |
+|  | **fio** | **108 µs** | **9,685 MB/s** | **1.0 MB** | **13** | 🏆⚡💾 |
+| **10MB** | normal | 2.66 ms | 3,939 MB/s | 32 MB | 17 |  |
+|  | **fio** | **1.33 ms** | **7,893 MB/s** | **10 MB** | **13** | 🏆⚡💾 |
+| **100MB** | normal | 16.7 ms | 6,290 MB/s | 256 MB | 20 |  |
+|  | **fio** | **16.3 ms** | **6,432 MB/s** | **100 MB** | **13** | 🏆⚡💾 |
 
 ### File Source → File Storage
 | Size | Method | Speed | Throughput | Memory | Allocs | Notes |
 |------|--------|-------|------------|--------|--------|-------|
-| **1KB** | **normal** | **142.3 µs** | **7.2 MB/s** | **33,696 B** | **13** | 🏆⚡💾 |
-|  | fio | 162.3 µs | 6.3 MB/s | 33,733 B | 17 |  |
-| **1MB** | **normal** | **532.9 µs** | **1,968 MB/s** | **33,712 B** | **13** | 🏆⚡💾 |
-|  | fio | 558.2 µs | 1,879 MB/s | 33,720 B | 17 |  |
-| **10MB** | **normal** | **4.12 ms** | **2,543 MB/s** | **33,713 B** | **13** | 🏆⚡💾 |
-|  | fio | 4.83 ms | 2,169 MB/s | 33,723 B | 17 |  |
-| **100MB** | **normal** | **35.87 ms** | **2,923 MB/s** | **33,727 B** | **13** | 🏆⚡💾 |
-|  | fio | 45.47 ms | 2,306 MB/s | 33,737 B | 17 |  |
+| **1KB** | **normal** | **144 µs** | **7.1 MB/s** | **33,696 B** | **13** | ⚡💾 |
+|  | fio | 166 µs | 6.2 MB/s | 33,730 B | 17 |  |
+| **1MB** | **normal** | **513 µs** | **2,043 MB/s** | **33,712 B** | **13** | ⚡💾 |
+|  | fio | 573 µs | 1,830 MB/s | 33,730 B | 17 |  |
+| **10MB** | **normal** | **4.32 ms** | **2,425 MB/s** | **33,712 B** | **13** | ⚡💾 |
+|  | fio | 4.51 ms | 2,326 MB/s | 33,721 B | 17 |  |
+| **100MB** | normal | 44.0 ms | 2,385 MB/s | 33,717 B | 13 |  |
+|  | **fio** | **41.1 ms** | **2,553 MB/s** | 33,723 B | 17 | 🏆⚡ |
 
 ### Summary
 | Scenario | Winner | Why |
 |----------|--------|-----|
 | **bytes → memory** | 🏆 **fio** | Zero-copy, fastest in all sizes, minimal memory |
-| **bytes → file** | **normal** | Faster at 1KB/10MB/100MB; fio uses slightly less memory and wins at 1MB |
-| **file → memory** | **fio** | Faster for 1KB–10MB with lower memory; 100MB slower but still uses less memory |
-| **file → file** | **normal** | Faster across all sizes; memory is effectively the same |
+| **bytes → file** | 🏆 **fio** | Faster at 1MB/10MB/100MB (28-41% faster); slightly slower at 1KB |
+| **file → memory** | 🏆 **fio** | Faster for all sizes with 50% less memory |
+| **file → file** | **mixed** | normal faster at small sizes (4-12%); fio faster at 100MB (7%) |
 
 ### Key Takeaways
 
 1. **fio bytes→memory is zero-copy** - constant-time regardless of data size
-2. **Memory efficiency** - fio allocates dramatically less for bytes sources and less for file→memory
-3. **Bytes→file is mixed** - normal wins most sizes, fio wins 1MB and uses slightly less memory
-4. **File→file favors normal** - normal is faster across all sizes with similar memory
+2. **fio bytes→file is optimized** - 28-41% faster than normal for 1MB+ files
+3. **fio file→memory is efficient** - 7x faster at 1MB with 50% less memory
+4. **file→file is competitive** - fio slightly slower at small files (~10%), faster at large files
 
 ### Run Benchmarks
 
 ```bash
 # Basic benchmark
-go test -bench=BenchmarkCompareFioSio -benchmem
+go test -bench=BenchmarkCompareFioSio -benchmem -benchtime=3s
 
 # With mmap enabled (Unix only)
-FIO_BENCH_USE_MMAP=true go test -bench=BenchmarkCompareFioSio -benchmem
-
+FIO_BENCH_USE_MMAP=true go test -bench=BenchmarkCompareFioSio -benchmem -benchtime=3s
 ```
