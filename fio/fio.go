@@ -355,9 +355,65 @@ func (r *readerAtCloser) Close() error               { return nil }
 /* --------------------------- Input options -------------------------------- */
 
 type InOption func(*inConfig)
-type inConfig struct{ reusable bool }
+type inConfig struct {
+	reusable       bool
+	deleteAfterUse bool
+}
 
 func Reusable() InOption { return func(c *inConfig) { c.reusable = true } }
+
+// DeleteAfterUse deletes local temp files for file/stream sources after read.
+func DeleteAfterUse() InOption { return func(c *inConfig) { c.deleteAfterUse = true } }
+
+// In keeps legacy call sites; DeleteAfterUse is best-effort in fio.
+func In(src Source, opts ...InOption) Source {
+	if src == nil {
+		return src
+	}
+	cfg := &inConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(cfg)
+		}
+	}
+	if !cfg.deleteAfterUse {
+		return src
+	}
+	return deleteAfterUseSource{src: src}
+}
+
+type deleteAfterUseSource struct{ src Source }
+
+func (d deleteAfterUseSource) open(ctx context.Context) (io.ReadCloser, func() error, int64, string, string, error) {
+	if d.src == nil {
+		return nil, nil, -1, "", "", ErrNilSource
+	}
+	rc, cleanup, size, kind, path, err := d.src.open(ctx)
+	if err != nil {
+		return nil, nil, -1, "", "", err
+	}
+
+	cleanupFn := func() error {
+		var err error
+		if cleanup != nil {
+			err = errors.Join(err, cleanup())
+		} else if rc != nil {
+			err = errors.Join(err, rc.Close())
+		}
+
+		if path != "" && (kind == KindFile || kind == KindStream) {
+			if osrc, ok := d.src.(outputSource); ok && osrc.o != nil && osrc.o.keep {
+				return err
+			}
+			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				err = errors.Join(err, rmErr)
+			}
+		}
+		return err
+	}
+
+	return rc, cleanupFn, size, kind, path, nil
+}
 
 // OpenIn opens a type-safe Source and returns an Input.
 // If Reusable() is set, it will buffer (non-file) into memory or use ReaderAt for files.
