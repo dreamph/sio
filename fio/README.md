@@ -78,9 +78,12 @@ data, _ := output.Bytes()
 
 ```go
 // Read and process a file
-result, err := fio.Read(ctx, fio.PathSource("data.json"), func(r io.Reader) (MyData, error) {
+result, err := fio.Read(ctx, fio.PathSource("data.json"), func(r io.Reader) (*MyData, error) {
     var data MyData
-    return data, json.NewDecoder(r).Decode(&data)
+    if err := json.NewDecoder(r).Decode(&data); err != nil {
+        return nil, err
+    }
+    return &data, nil
 })
 ```
 
@@ -249,10 +252,14 @@ output, err := fio.DoOut(ctx, fio.Out(".txt"),
 
 ```go
 output, metadata, err := fio.DoOutResult(ctx, fio.Out(".txt"),
-    func(ctx context.Context, s *fio.OutScope, w io.Writer) (Metadata, error) {
+    func(ctx context.Context, s *fio.OutScope, w io.Writer) (*Metadata, error) {
         r, size := s.UseSized(fio.PathSource("input.txt"))
         _, err := io.Copy(w, r)
-        return Metadata{Size: size}, err
+        if err != nil {
+            return nil, err
+        }
+        m := Metadata{Size: size}
+        return &m, nil
     })
 ```
 

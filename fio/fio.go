@@ -1770,11 +1770,10 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 /*                                   Do API                                   */
 /* -------------------------------------------------------------------------- */
 
-// Do: returns T only (NO output possible; Scope has no NewOut)
-func Do[T any](ctx context.Context, fn func(s *Scope) (T, error)) (T, error) {
-	var zero T
+// Do: returns *T only (NO output possible; Scope has no NewOut)
+func Do[T any](ctx context.Context, fn func(s *Scope) (*T, error)) (*T, error) {
 	if fn == nil {
-		return zero, ErrNilFunc
+		return nil, ErrNilFunc
 	}
 
 	s := &Scope{
@@ -1785,7 +1784,7 @@ func Do[T any](ctx context.Context, fn func(s *Scope) (T, error)) (T, error) {
 	res, err := fn(s)
 	finErr := s.finalize(err)
 	if finErr != nil {
-		return zero, finErr
+		return nil, finErr
 	}
 	return res, nil
 }
@@ -1813,11 +1812,10 @@ func DoOut(ctx context.Context, outCfg OutConfig, fn func(ctx context.Context, s
 	return out, nil
 }
 
-// DoOutResult: returns *Output + T (output-capable scope)
-func DoOutResult[T any](ctx context.Context, outCfg OutConfig, fn func(ctx context.Context, s *OutScope, w io.Writer) (T, error)) (*Output, T, error) {
-	var zero T
+// DoOutResult: returns *Output + *T (output-capable scope)
+func DoOutResult[T any](ctx context.Context, outCfg OutConfig, fn func(ctx context.Context, s *OutScope, w io.Writer) (*T, error)) (*Output, *T, error) {
 	if fn == nil {
-		return nil, zero, ErrNilFunc
+		return nil, nil, ErrNilFunc
 	}
 
 	s := &OutScope{
@@ -1832,7 +1830,7 @@ func DoOutResult[T any](ctx context.Context, outCfg OutConfig, fn func(ctx conte
 	res, err := fn(ctx, s, w)
 	out, finErr := s.finalizeOut(err)
 	if finErr != nil {
-		return nil, zero, finErr
+		return nil, nil, finErr
 	}
 	return out, res, nil
 }
@@ -2051,40 +2049,54 @@ func Process(ctx context.Context, src Source, out OutConfig, fn func(r io.Reader
 	})
 }
 
-func ProcessResult[T any](ctx context.Context, src Source, out OutConfig, fn func(r io.Reader, w io.Writer) (T, error)) (*Output, T, error) {
-	var zero T
-	if fn == nil {
-		return nil, zero, ErrNilFunc
+func ProcessList(ctx context.Context, srcs []Source, out OutConfig, fn func(readers []io.Reader, w io.Writer) error) (*Output, error) {
+	if len(srcs) == 0 {
+		return nil, ErrNilSource
 	}
-	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (T, error) {
+	if fn == nil {
+		return nil, ErrNilFunc
+	}
+	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
+		readers := make([]io.Reader, 0, len(srcs))
+		for _, src := range srcs {
+			r, _ := s.UseSized(src)
+			readers = append(readers, r)
+		}
+		return fn(readers, w)
+	})
+}
+
+func ProcessResult[T any](ctx context.Context, src Source, out OutConfig, fn func(r io.Reader, w io.Writer) (*T, error)) (*Output, *T, error) {
+	if fn == nil {
+		return nil, nil, ErrNilFunc
+	}
+	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (*T, error) {
 		r, _ := s.UseSized(src)
 		return fn(r, w)
 	})
 }
 
-func ProcessAtResult[T any](ctx context.Context, src Source, out OutConfig, fn func(ra io.ReaderAt, size int64, w io.Writer) (T, error), opts ...ToReaderAtOption) (*Output, T, error) {
-	var zero T
+func ProcessAtResult[T any](ctx context.Context, src Source, out OutConfig, fn func(ra io.ReaderAt, size int64, w io.Writer) (*T, error), opts ...ToReaderAtOption) (*Output, *T, error) {
 	if fn == nil {
-		return nil, zero, ErrNilFunc
+		return nil, nil, ErrNilFunc
 	}
-	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (T, error) {
+	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (*T, error) {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
-			return zero, ErrCannotGetReaderAt
+			return nil, ErrCannotGetReaderAt
 		}
 		return fn(ra, size, w)
 	})
 }
 
-func ProcessListResult[T any](ctx context.Context, srcs []Source, out OutConfig, fn func(readers []io.Reader, w io.Writer) (T, error)) (*Output, T, error) {
-	var zero T
+func ProcessListResult[T any](ctx context.Context, srcs []Source, out OutConfig, fn func(readers []io.Reader, w io.Writer) (*T, error)) (*Output, *T, error) {
 	if len(srcs) == 0 {
-		return nil, zero, ErrNilSource
+		return nil, nil, ErrNilSource
 	}
 	if fn == nil {
-		return nil, zero, ErrNilFunc
+		return nil, nil, ErrNilFunc
 	}
-	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (T, error) {
+	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (*T, error) {
 		readers := make([]io.Reader, 0, len(srcs))
 		var total int64
 		for _, src := range srcs {
@@ -2113,15 +2125,15 @@ func ProcessAt(ctx context.Context, src Source, out OutConfig, fn func(ra io.Rea
 	})
 }
 
-func Read[T any](ctx context.Context, src Source, fn func(r io.Reader) (T, error)) (T, error) {
-	var zero T
+func Read(ctx context.Context, src Source, fn func(r io.Reader) error) error {
 	if fn == nil {
-		return zero, ErrNilFunc
+		return ErrNilFunc
 	}
-	return Do(ctx, func(s *Scope) (T, error) {
+	_, err := Do(ctx, func(s *Scope) (*Void, error) {
 		r := s.Use(src)
-		return fn(r)
+		return nil, fn(r)
 	})
+	return err
 }
 
 func ReadResult[T any](ctx context.Context, src Source, fn func(r io.Reader) (*T, error)) (*T, error) {
@@ -2134,18 +2146,18 @@ func ReadResult[T any](ctx context.Context, src Source, fn func(r io.Reader) (*T
 	})
 }
 
-func ReadAt[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt, size int64) (T, error), opts ...ToReaderAtOption) (T, error) {
-	var zero T
+func ReadAt(ctx context.Context, src Source, fn func(ra io.ReaderAt, size int64) error, opts ...ToReaderAtOption) error {
 	if fn == nil {
-		return zero, ErrNilFunc
+		return ErrNilFunc
 	}
-	return Do(ctx, func(s *Scope) (T, error) {
+	_, err := Do(ctx, func(s *Scope) (*Void, error) {
 		ra, size := s.UseReaderAt(src, opts...)
 		if ra == nil {
-			return zero, ErrCannotGetReaderAt
+			return nil, ErrCannotGetReaderAt
 		}
-		return fn(ra, size)
+		return nil, fn(ra, size)
 	})
+	return err
 }
 
 func ReadAtResult[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt, size int64) (*T, error), opts ...ToReaderAtOption) (*T, error) {
@@ -2159,6 +2171,26 @@ func ReadAtResult[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt
 		}
 		return fn(ra, size)
 	})
+}
+
+func ReadList(ctx context.Context, srcs []Source, fn func(readers []io.Reader) error) error {
+	if len(srcs) == 0 {
+		return ErrNilSource
+	}
+	if fn == nil {
+		return ErrNilFunc
+	}
+	_, err := Do(ctx, func(s *Scope) (*Void, error) {
+		readers := make([]io.Reader, 0, len(srcs))
+		for _, src := range srcs {
+			readers = append(readers, s.Use(src))
+		}
+		if err := fn(readers); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+	return err
 }
 
 func ReadListResult[T any](ctx context.Context, srcs []Source, fn func(readers []io.Reader) (*T, error)) (*T, error) {
@@ -2345,17 +2377,20 @@ func ReadLines(ctx context.Context, src Source, fn LineFunc) error {
 		return nil
 	}
 
-	_, err := Do(ctx, func(s *Scope) (Void, error) {
+	_, err := Do(ctx, func(s *Scope) (*Void, error) {
 		r := s.Use(src)
 		scanner := bufio.NewScanner(r)
 		buf := make([]byte, 0, 64*1024)
 		scanner.Buffer(buf, 1024*1024)
 		for scanner.Scan() {
 			if err := fn(scanner.Text()); err != nil {
-				return Void{}, err
+				return nil, err
 			}
 		}
-		return Void{}, scanner.Err()
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	})
 	return err
 }

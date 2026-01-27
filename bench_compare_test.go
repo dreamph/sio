@@ -115,9 +115,9 @@ func benchFioReadOnly(b *testing.B, size int, src sourceFactory) {
 	ctx := context.Background()
 
 	for i := 0; i < b.N; i++ {
-		_, err := fio.Read(ctx, src.makeFio(), func(r io.Reader) (fio.Void, error) {
+		err := fio.Read(ctx, src.makeFio(), func(r io.Reader) error {
 			_, err := io.Copy(io.Discard, r)
-			return fio.Void{}, err
+			return err
 		})
 		if err != nil {
 			b.Fatalf("Read: %v", err)

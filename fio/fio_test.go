@@ -178,9 +178,14 @@ func TestCopyAndProcess(t *testing.T) {
 func TestReadAndResults(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 
-	n, err := Read(ctx, BytesSource([]byte("abc")), func(r io.Reader) (int, error) {
+	var n int
+	err := Read[int](ctx, BytesSource([]byte("abc")), func(r io.Reader) error {
 		b, err := io.ReadAll(r)
-		return len(b), err
+		if err != nil {
+			return err
+		}
+		n = len(b)
+		return nil
 	})
 	if err != nil || n != 3 {
 		t.Fatalf("Read = %d, %v", n, err)
@@ -195,12 +200,13 @@ func TestReadAndResults(t *testing.T) {
 		t.Fatalf("ReadResult = %v, %v", res, err)
 	}
 
-	out, got, err := ProcessResult(ctx, BytesSource([]byte("hi")), Out(Txt), func(r io.Reader, w io.Writer) (string, error) {
+	out, got, err := ProcessResult(ctx, BytesSource([]byte("hi")), Out(Txt), func(r io.Reader, w io.Writer) (*string, error) {
 		_, err := io.Copy(w, r)
-		return "ok", err
+		s := "ok"
+		return &s, err
 	})
-	if err != nil || got != "ok" {
-		t.Fatalf("ProcessResult = %q, %v", got, err)
+	if err != nil || got == nil || *got != "ok" {
+		t.Fatalf("ProcessResult = %v, %v", got, err)
 	}
 	if out == nil {
 		t.Fatalf("ProcessResult output is nil")
@@ -210,18 +216,19 @@ func TestReadAndResults(t *testing.T) {
 func TestReadAtAndProcessAt(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 
-	got, err := ReadAt(ctx, BytesSource([]byte("hello")), func(ra io.ReaderAt, size int64) (string, error) {
+	got, err := ReadAtResult(ctx, BytesSource([]byte("hello")), func(ra io.ReaderAt, size int64) (*string, error) {
 		buf := make([]byte, 2)
 		if _, err := ra.ReadAt(buf, 1); err != nil && !errors.Is(err, io.EOF) {
-			return "", err
+			return nil, err
 		}
 		if size != 5 {
-			return "", errors.New("bad size")
+			return nil, errors.New("bad size")
 		}
-		return string(buf), nil
+		s := string(buf)
+		return &s, nil
 	})
-	if err != nil || got != "el" {
-		t.Fatalf("ReadAt = %q, %v", got, err)
+	if err != nil || got == nil || *got != "el" {
+		t.Fatalf("ReadAt = %v, %v", got, err)
 	}
 
 	out, err := ProcessAt(ctx, BytesSource([]byte("hello")), Out(Txt), func(ra io.ReaderAt, size int64, w io.Writer) error {
@@ -366,14 +373,21 @@ func TestOpenInReusable(t *testing.T) {
 	t.Cleanup(func() { _ = in.Close() })
 
 	readOnce := func() string {
-		got, err := Read(ctx, InputSource(in), func(r io.Reader) (string, error) {
+		got, err := ReadResult(ctx, InputSource(in), func(r io.Reader) (*string, error) {
 			b, err := io.ReadAll(r)
-			return string(b), err
+			if err != nil {
+				return nil, err
+			}
+			s := string(b)
+			return &s, nil
 		})
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
-		return got
+		if got == nil {
+			t.Fatalf("Read: nil result")
+		}
+		return *got
 	}
 	if got := readOnce(); got != "abc" {
 		t.Fatalf("Read once = %q", got)
@@ -433,12 +447,16 @@ func TestURLSource(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	ctx, _ := newTestSession(t, Memory)
-	got, err := Read(ctx, URLSource(srv.URL), func(r io.Reader) (string, error) {
+	got, err := ReadResult(ctx, URLSource(srv.URL), func(r io.Reader) (*string, error) {
 		b, err := io.ReadAll(r)
-		return string(b), err
+		if err != nil {
+			return nil, err
+		}
+		s := string(b)
+		return &s, nil
 	})
-	if err != nil || got != "ok" {
-		t.Fatalf("URLSource = %q, %v", got, err)
+	if err != nil || got == nil || *got != "ok" {
+		t.Fatalf("URLSource = %v, %v", got, err)
 	}
 }
 
@@ -467,19 +485,23 @@ func TestMultipartSource(t *testing.T) {
 	}
 
 	ctx, _ := newTestSession(t, Memory)
-	got, err := Read(ctx, MultipartSource(files[0]), func(r io.Reader) (string, error) {
+	got, err := ReadResult(ctx, MultipartSource(files[0]), func(r io.Reader) (*string, error) {
 		b, err := io.ReadAll(r)
-		return string(b), err
+		if err != nil {
+			return nil, err
+		}
+		s := string(b)
+		return &s, nil
 	})
-	if err != nil || got != "hello" {
-		t.Fatalf("MultipartSource = %q, %v", got, err)
+	if err != nil || got == nil || *got != "hello" {
+		t.Fatalf("MultipartSource = %v, %v", got, err)
 	}
 }
 
 func TestErrorPaths(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 
-	if _, err := Read[int](ctx, BytesSource([]byte("x")), nil); !errors.Is(err, ErrNilFunc) {
+	if err := Read[int](ctx, BytesSource([]byte("x")), nil); !errors.Is(err, ErrNilFunc) {
 		t.Fatalf("Read nil fn: %v", err)
 	}
 	if _, err := Copy(ctx, nil, Out(".txt")); !errors.Is(err, ErrNilSource) {
