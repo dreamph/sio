@@ -109,6 +109,7 @@ var (
 	ErrInputNotReusable       = errors.New("fio: input is not reusable")
 	ErrCannotResetInput       = errors.New("fio: cannot reset input")
 	ErrToReaderAtNilReader    = errors.New("fio: ToReaderAt: nil reader")
+	ErrNilInput               = errors.New("fio: nil input")
 )
 
 /* -------------------------------------------------------------------------- */
@@ -315,7 +316,7 @@ func (in *Input) ReaderAt() io.ReaderAt {
 
 func (in *Input) Reset() error {
 	if in == nil {
-		return errors.New("fio: nil input")
+		return ErrNilInput
 	}
 	if !in.reusable {
 		return ErrInputNotReusable
@@ -1314,22 +1315,19 @@ func NewOut(ctx context.Context, out OutConfig, sizeHint ...int64) (*OutHandle, 
 type Scope struct {
 	ctx      context.Context
 	cleanups []func() error
-	err      error
 }
 
 // Use opens a type-safe Source and returns reader. Cleanup is automatic.
 func (s *Scope) Use(src Source) (io.Reader, error) {
 	if src == nil {
 		err := ErrNilSource
-		s.err = errors.Join(s.err, err)
-		return errReader{err}, err
+		return nil, err
 	}
 
 	if b, ok := src.(bytesSource); ok {
 		if b == nil {
 			err := ErrNilSource
-			s.err = errors.Join(s.err, err)
-			return errReader{err}, err
+			return nil, err
 		}
 		return bytes.NewReader(b), nil
 	}
@@ -1337,8 +1335,7 @@ func (s *Scope) Use(src Source) (io.Reader, error) {
 	// reusable Input fast-path
 	if is, ok := src.(inputSource); ok && is.in != nil && is.in.IsReusable() {
 		if err := is.in.Reset(); err != nil {
-			s.err = errors.Join(s.err, err)
-			return errReader{err}, err
+			return nil, err
 		}
 		is.in.markUsed()
 		return is.in.Reader, nil
@@ -1346,8 +1343,7 @@ func (s *Scope) Use(src Source) (io.Reader, error) {
 
 	rc, cleanup, _, _, _, err := src.open(s.ctx)
 	if err != nil {
-		s.err = errors.Join(s.err, err)
-		return errReader{err}, err
+		return nil, err
 	}
 	if cleanup != nil {
 		s.cleanups = append(s.cleanups, cleanup)
@@ -1361,23 +1357,20 @@ func (s *Scope) Use(src Source) (io.Reader, error) {
 func (s *Scope) UseSized(src Source) (io.Reader, int64, error) {
 	if src == nil {
 		err := ErrNilSource
-		s.err = errors.Join(s.err, err)
-		return errReader{err}, -1, err
+		return nil, -1, err
 	}
 
 	if b, ok := src.(bytesSource); ok {
 		if b == nil {
 			err := ErrNilSource
-			s.err = errors.Join(s.err, err)
-			return errReader{err}, -1, err
+			return nil, -1, err
 		}
 		return bytes.NewReader(b), int64(len(b)), nil
 	}
 
 	if is, ok := src.(inputSource); ok && is.in != nil && is.in.IsReusable() {
 		if err := is.in.Reset(); err != nil {
-			s.err = errors.Join(s.err, err)
-			return errReader{err}, -1, err
+			return nil, -1, err
 		}
 		is.in.markUsed()
 		return is.in.Reader, is.in.Size, nil
@@ -1385,8 +1378,7 @@ func (s *Scope) UseSized(src Source) (io.Reader, int64, error) {
 
 	rc, cleanup, size, _, _, err := src.open(s.ctx)
 	if err != nil {
-		s.err = errors.Join(s.err, err)
-		return errReader{err}, -1, err
+		return nil, -1, err
 	}
 	if cleanup != nil {
 		s.cleanups = append(s.cleanups, cleanup)
@@ -1401,7 +1393,6 @@ func (s *Scope) UseSized(src Source) (io.Reader, int64, error) {
 func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64, error) {
 	if src == nil {
 		err := ErrNilSource
-		s.err = errors.Join(s.err, err)
 		return nil, -1, err
 	}
 
@@ -1417,7 +1408,6 @@ func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, 
 
 	rc, cleanup, size, _, _, err := src.open(s.ctx)
 	if err != nil {
-		s.err = errors.Join(s.err, err)
 		return nil, -1, err
 	}
 
@@ -1430,15 +1420,14 @@ func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, 
 		return ra, size, nil
 	}
 
-	res, rerr := ToReaderAt(s.ctx, rc, opts...)
+	res, err := ToReaderAt(s.ctx, rc, opts...)
 	if cleanup != nil {
 		_ = cleanup()
 	} else {
 		_ = rc.Close()
 	}
-	if rerr != nil {
-		s.err = errors.Join(s.err, rerr)
-		return nil, -1, rerr
+	if err != nil {
+		return nil, -1, err
 	}
 	if res != nil && res.cleanup != nil {
 		s.cleanups = append(s.cleanups, res.cleanup)
@@ -1448,8 +1437,6 @@ func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, 
 	}
 	return res.ReaderAt(), res.Size(), nil
 }
-
-func (s *Scope) Err() error { return s.err }
 
 func (s *Scope) cleanup() {
 	for i := len(s.cleanups) - 1; i >= 0; i-- {
@@ -1461,9 +1448,6 @@ func (s *Scope) cleanup() {
 }
 
 func (s *Scope) finalize(fnErr error) error {
-	if s.err != nil {
-		fnErr = errors.Join(fnErr, s.err)
-	}
 	s.cleanup()
 	return fnErr
 }
@@ -1512,7 +1496,11 @@ func (w *lazyOutWriter) Write(p []byte) (int, error) {
 		return 0, ErrNilOutScope
 	}
 	if w.writer == nil {
-		w.writer = w.scope.ensureOutWriter()
+		writer, err := w.scope.ensureOutWriter()
+		if err != nil {
+			return 0, err
+		}
+		w.writer = writer
 	}
 	return w.writer.Write(p)
 }
@@ -1522,7 +1510,11 @@ func (w *lazyOutWriter) ReadFrom(r io.Reader) (int64, error) {
 		return 0, ErrNilOutScope
 	}
 	if w.writer == nil {
-		w.writer = w.scope.ensureOutWriter()
+		writer, err := w.scope.ensureOutWriter()
+		if err != nil {
+			return 0, err
+		}
+		w.writer = writer
 	}
 	if rf, ok := w.writer.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
@@ -1530,9 +1522,9 @@ func (w *lazyOutWriter) ReadFrom(r io.Reader) (int64, error) {
 	return io.Copy(w.writer, r)
 }
 
-func (s *OutScope) ensureOutWriter() io.Writer {
+func (s *OutScope) ensureOutWriter() (io.Writer, error) {
 	if s.outHandle != nil {
-		return s.outHandle.Writer
+		return s.outHandle.Writer, nil
 	}
 	hint := int64(-1)
 	if s.outSizeHintSet {
@@ -1542,11 +1534,9 @@ func (s *OutScope) ensureOutWriter() io.Writer {
 }
 
 // NewOut creates output writer (only available in OutScope).
-func (s *OutScope) NewOut(out OutConfig, sizeHint ...int64) io.Writer {
+func (s *OutScope) NewOut(out OutConfig, sizeHint ...int64) (io.Writer, error) {
 	if s.outHandle != nil {
-		err := ErrNewOutMultiple
-		s.err = errors.Join(s.err, err)
-		return errWriter{err}
+		return nil, ErrNewOutMultiple
 	}
 
 	if out.reuseEnabled {
@@ -1555,19 +1545,14 @@ func (s *OutScope) NewOut(out OutConfig, sizeHint ...int64) io.Writer {
 
 	oh, err := NewOut(s.ctx, out, sizeHint...)
 	if err != nil {
-		s.err = errors.Join(s.err, err)
-		return errWriter{err}
+		return nil, err
 	}
 
 	s.outHandle = oh
-	return oh.Writer
+	return oh.Writer, nil
 }
 
 func (s *OutScope) finalizeOut(fnErr error) (*Output, error) {
-	if s.err != nil {
-		fnErr = errors.Join(fnErr, s.err)
-	}
-
 	// cleanup inputs first
 	s.cleanup()
 
@@ -1651,19 +1636,15 @@ func (w *memWriteCloser) Close() error {
 	return nil
 }
 
-func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
+func (s *OutScope) newOutReuse(cfg OutConfig) (io.Writer, error) {
 	if s == nil {
-		return errWriter{ErrNilOutScope}
+		return nil, ErrNilOutScope
 	}
 	if s.outHandle != nil {
-		err := ErrNewOutMultiple
-		s.err = errors.Join(s.err, err)
-		return errWriter{err}
+		return nil, ErrNewOutMultiple
 	}
 	if cfg.reusePtr == nil {
-		err := ErrOutReuseRequiresPtr
-		s.err = errors.Join(s.err, err)
-		return errWriter{err}
+		return nil, ErrOutReuseRequiresPtr
 	}
 	outPtr := cfg.reusePtr
 	reuseCfg := cfg.reuseCfg
@@ -1673,19 +1654,14 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 
 	ses := Session(s.ctx)
 	if ses == nil {
-		err := ErrNoSession
-		s.err = errors.Join(s.err, err)
-		return errWriter{err}
+		return nil, ErrNoSession
 	}
 	iSes, ok := ses.(*ioSession)
 	if !ok {
-		err := ErrInvalidSessionType
-		s.err = errors.Join(s.err, err)
-		return errWriter{err}
+		return nil, ErrInvalidSessionType
 	}
 	if err := iSes.ensureOpen(); err != nil {
-		s.err = errors.Join(s.err, err)
-		return errWriter{err}
+		return nil, err
 	}
 
 	storageType := iSes.storageType
@@ -1713,8 +1689,7 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 	} else {
 		newOut, err := iSes.newOutput(cfg.ext, storageType)
 		if err != nil {
-			s.err = errors.Join(s.err, err)
-			return errWriter{err}
+			return nil, err
 		}
 		out = newOut
 		*outPtr = out
@@ -1740,15 +1715,14 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 
 		wc := &memWriteCloser{buf: buf, output: out, cfg: reuseCfg}
 		s.outHandle = &OutHandle{Writer: wc, output: out, session: iSes}
-		return wc
+		return wc, nil
 
 	default: // File
 		if prev != nil && prev.StorageType() == File && reuseCfg.cleanupOld {
 			_ = prev.cleanup()
 			newOut, err := iSes.newOutput(cfg.ext, File)
 			if err != nil {
-				s.err = errors.Join(s.err, err)
-				return errWriter{err}
+				return nil, err
 			}
 			out = newOut
 			*outPtr = out
@@ -1757,12 +1731,11 @@ func (s *OutScope) newOutReuse(cfg OutConfig) io.Writer {
 		w, err := out.OpenWriter()
 		if err != nil {
 			_ = out.cleanup()
-			s.err = errors.Join(s.err, err)
-			return errWriter{err}
+			return nil, err
 		}
 
 		s.outHandle = &OutHandle{Writer: w, output: out, session: iSes}
-		return w
+		return w, nil
 	}
 }
 
@@ -2151,9 +2124,9 @@ func Read(ctx context.Context, src Source, fn func(r io.Reader) error) error {
 		return ErrNilFunc
 	}
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
-		r, rerr := s.Use(src)
-		if rerr != nil {
-			return nil, rerr
+		r, useErr := s.Use(src)
+		if useErr != nil {
+			return nil, useErr
 		}
 		return nil, fn(r)
 	})
@@ -2165,9 +2138,9 @@ func ReadResult[T any](ctx context.Context, src Source, fn func(r io.Reader) (*T
 		return nil, ErrNilFunc
 	}
 	return Do(ctx, func(s *Scope) (*T, error) {
-		r, rerr := s.Use(src)
-		if rerr != nil {
-			return nil, rerr
+		r, useErr := s.Use(src)
+		if useErr != nil {
+			return nil, useErr
 		}
 		return fn(r)
 	})
@@ -2178,9 +2151,9 @@ func ReadAt(ctx context.Context, src Source, fn func(ra io.ReaderAt, size int64)
 		return ErrNilFunc
 	}
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
-		ra, size, rerr := s.UseReaderAt(src, opts...)
-		if rerr != nil {
-			return nil, rerr
+		ra, size, useErr := s.UseReaderAt(src, opts...)
+		if useErr != nil {
+			return nil, useErr
 		}
 		if ra == nil {
 			return nil, ErrCannotGetReaderAt
@@ -2195,9 +2168,9 @@ func ReadAtResult[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt
 		return nil, ErrNilFunc
 	}
 	return Do(ctx, func(s *Scope) (*T, error) {
-		ra, size, rerr := s.UseReaderAt(src, opts...)
-		if rerr != nil {
-			return nil, rerr
+		ra, size, useErr := s.UseReaderAt(src, opts...)
+		if useErr != nil {
+			return nil, useErr
 		}
 		if ra == nil {
 			return nil, ErrCannotGetReaderAt
@@ -2216,9 +2189,9 @@ func ReadList(ctx context.Context, srcs []Source, fn func(readers []io.Reader) e
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
 		readers := make([]io.Reader, 0, len(srcs))
 		for _, src := range srcs {
-			r, rerr := s.Use(src)
-			if rerr != nil {
-				return nil, rerr
+			r, useErr := s.Use(src)
+			if useErr != nil {
+				return nil, useErr
 			}
 			readers = append(readers, r)
 		}
@@ -2240,9 +2213,9 @@ func ReadListResult[T any](ctx context.Context, srcs []Source, fn func(readers [
 	return Do(ctx, func(s *Scope) (*T, error) {
 		readers := make([]io.Reader, 0, len(srcs))
 		for _, src := range srcs {
-			r, rerr := s.Use(src)
-			if rerr != nil {
-				return nil, rerr
+			r, useErr := s.Use(src)
+			if useErr != nil {
+				return nil, useErr
 			}
 			readers = append(readers, r)
 		}
@@ -2419,9 +2392,9 @@ func ReadLines(ctx context.Context, src Source, fn LineFunc) error {
 	}
 
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
-		r, rerr := s.Use(src)
-		if rerr != nil {
-			return nil, rerr
+		r, useErr := s.Use(src)
+		if useErr != nil {
+			return nil, useErr
 		}
 		scanner := bufio.NewScanner(r)
 		buf := make([]byte, 0, 64*1024)
@@ -2817,14 +2790,6 @@ func minInt64(a, b int64) int64 {
 /* -------------------------------------------------------------------------- */
 /*                                  Helpers                                   */
 /* -------------------------------------------------------------------------- */
-
-type errReader struct{ err error }
-
-func (e errReader) Read(p []byte) (int, error) { return 0, e.err }
-
-type errWriter struct{ err error }
-
-func (e errWriter) Write(p []byte) (int, error) { return 0, e.err }
 
 func fileSize(f *os.File) int64 {
 	if f == nil {
