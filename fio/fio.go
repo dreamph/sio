@@ -1318,36 +1318,36 @@ type Scope struct {
 }
 
 // Use opens a type-safe Source and returns reader. Cleanup is automatic.
-func (s *Scope) Use(src Source) io.Reader {
+func (s *Scope) Use(src Source) (io.Reader, error) {
 	if src == nil {
 		err := ErrNilSource
 		s.err = errors.Join(s.err, err)
-		return errReader{err}
+		return errReader{err}, err
 	}
 
 	if b, ok := src.(bytesSource); ok {
 		if b == nil {
 			err := ErrNilSource
 			s.err = errors.Join(s.err, err)
-			return errReader{err}
+			return errReader{err}, err
 		}
-		return bytes.NewReader(b)
+		return bytes.NewReader(b), nil
 	}
 
 	// reusable Input fast-path
 	if is, ok := src.(inputSource); ok && is.in != nil && is.in.IsReusable() {
 		if err := is.in.Reset(); err != nil {
 			s.err = errors.Join(s.err, err)
-			return errReader{err}
+			return errReader{err}, err
 		}
 		is.in.markUsed()
-		return is.in.Reader
+		return is.in.Reader, nil
 	}
 
 	rc, cleanup, _, _, _, err := src.open(s.ctx)
 	if err != nil {
 		s.err = errors.Join(s.err, err)
-		return errReader{err}
+		return errReader{err}, err
 	}
 	if cleanup != nil {
 		s.cleanups = append(s.cleanups, cleanup)
@@ -1355,54 +1355,54 @@ func (s *Scope) Use(src Source) io.Reader {
 		// safety: ensure rc closed
 		s.cleanups = append(s.cleanups, rc.Close)
 	}
-	return rc
+	return rc, nil
 }
 
-func (s *Scope) UseSized(src Source) (io.Reader, int64) {
+func (s *Scope) UseSized(src Source) (io.Reader, int64, error) {
 	if src == nil {
 		err := ErrNilSource
 		s.err = errors.Join(s.err, err)
-		return errReader{err}, -1
+		return errReader{err}, -1, err
 	}
 
 	if b, ok := src.(bytesSource); ok {
 		if b == nil {
 			err := ErrNilSource
 			s.err = errors.Join(s.err, err)
-			return errReader{err}, -1
+			return errReader{err}, -1, err
 		}
-		return bytes.NewReader(b), int64(len(b))
+		return bytes.NewReader(b), int64(len(b)), nil
 	}
 
 	if is, ok := src.(inputSource); ok && is.in != nil && is.in.IsReusable() {
 		if err := is.in.Reset(); err != nil {
 			s.err = errors.Join(s.err, err)
-			return errReader{err}, -1
+			return errReader{err}, -1, err
 		}
 		is.in.markUsed()
-		return is.in.Reader, is.in.Size
+		return is.in.Reader, is.in.Size, nil
 	}
 
 	rc, cleanup, size, _, _, err := src.open(s.ctx)
 	if err != nil {
 		s.err = errors.Join(s.err, err)
-		return errReader{err}, -1
+		return errReader{err}, -1, err
 	}
 	if cleanup != nil {
 		s.cleanups = append(s.cleanups, cleanup)
 	} else {
 		s.cleanups = append(s.cleanups, rc.Close)
 	}
-	return rc, size
+	return rc, size, nil
 }
 
 // UseReaderAt returns ReaderAt + size with options.
 // Buffers into memory or spills to temp file based on options.
-func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64) {
+func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64, error) {
 	if src == nil {
 		err := ErrNilSource
 		s.err = errors.Join(s.err, err)
-		return nil, -1
+		return nil, -1, err
 	}
 
 	// Input with ReaderAt support
@@ -1411,14 +1411,14 @@ func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, 
 			if !is.in.IsReusable() {
 				s.cleanups = append(s.cleanups, is.in.Close)
 			}
-			return ra, is.in.Size
+			return ra, is.in.Size, nil
 		}
 	}
 
 	rc, cleanup, size, _, _, err := src.open(s.ctx)
 	if err != nil {
 		s.err = errors.Join(s.err, err)
-		return nil, -1
+		return nil, -1, err
 	}
 
 	if ra, ok := rc.(io.ReaderAt); ok {
@@ -1427,7 +1427,7 @@ func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, 
 		} else {
 			s.cleanups = append(s.cleanups, rc.Close)
 		}
-		return ra, size
+		return ra, size, nil
 	}
 
 	res, rerr := ToReaderAt(s.ctx, rc, opts...)
@@ -1438,15 +1438,15 @@ func (s *Scope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, 
 	}
 	if rerr != nil {
 		s.err = errors.Join(s.err, rerr)
-		return nil, -1
+		return nil, -1, rerr
 	}
 	if res != nil && res.cleanup != nil {
 		s.cleanups = append(s.cleanups, res.cleanup)
 	}
 	if res == nil {
-		return nil, -1
+		return nil, -1, ErrCannotGetReaderAt
 	}
-	return res.ReaderAt(), res.Size()
+	return res.ReaderAt(), res.Size(), nil
 }
 
 func (s *Scope) Err() error { return s.err }
@@ -1489,17 +1489,17 @@ func (s *OutScope) setOutSizeHint(size int64) {
 }
 
 // UseSized opens a Source and records size for output decisions.
-func (s *OutScope) UseSized(src Source) (io.Reader, int64) {
-	r, size := s.Scope.UseSized(src)
+func (s *OutScope) UseSized(src Source) (io.Reader, int64, error) {
+	r, size, err := s.Scope.UseSized(src)
 	s.setOutSizeHint(size)
-	return r, size
+	return r, size, err
 }
 
 // UseReaderAt opens a Source as ReaderAt and records size for output decisions.
-func (s *OutScope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64) {
-	ra, size := s.Scope.UseReaderAt(src, opts...)
+func (s *OutScope) UseReaderAt(src Source, opts ...ToReaderAtOption) (io.ReaderAt, int64, error) {
+	ra, size, err := s.Scope.UseReaderAt(src, opts...)
 	s.setOutSizeHint(size)
-	return ra, size
+	return ra, size, err
 }
 
 type lazyOutWriter struct {
@@ -2033,8 +2033,11 @@ func copyFileToFile(iSes *ioSession, out OutConfig, srcPath string) (*Output, er
 
 func copyViaDoOut(ctx context.Context, src Source, out OutConfig) (*Output, error) {
 	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
-		r, _ := s.UseSized(src)
-		_, err := io.Copy(w, r)
+		r, _, err := s.UseSized(src)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, r)
 		return err
 	})
 }
@@ -2044,7 +2047,10 @@ func Process(ctx context.Context, src Source, out OutConfig, fn func(r io.Reader
 		return nil, ErrNilFunc
 	}
 	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
-		r, _ := s.UseSized(src)
+		r, _, err := s.UseSized(src)
+		if err != nil {
+			return err
+		}
 		return fn(r, w)
 	})
 }
@@ -2059,7 +2065,10 @@ func ProcessList(ctx context.Context, srcs []Source, out OutConfig, fn func(read
 	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
 		readers := make([]io.Reader, 0, len(srcs))
 		for _, src := range srcs {
-			r, _ := s.UseSized(src)
+			r, _, err := s.UseSized(src)
+			if err != nil {
+				return err
+			}
 			readers = append(readers, r)
 		}
 		return fn(readers, w)
@@ -2071,7 +2080,10 @@ func ProcessResult[T any](ctx context.Context, src Source, out OutConfig, fn fun
 		return nil, nil, ErrNilFunc
 	}
 	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (*T, error) {
-		r, _ := s.UseSized(src)
+		r, _, err := s.UseSized(src)
+		if err != nil {
+			return nil, err
+		}
 		return fn(r, w)
 	})
 }
@@ -2081,7 +2093,10 @@ func ProcessAtResult[T any](ctx context.Context, src Source, out OutConfig, fn f
 		return nil, nil, ErrNilFunc
 	}
 	return DoOutResult(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) (*T, error) {
-		ra, size := s.UseReaderAt(src, opts...)
+		ra, size, err := s.UseReaderAt(src, opts...)
+		if err != nil {
+			return nil, err
+		}
 		if ra == nil {
 			return nil, ErrCannotGetReaderAt
 		}
@@ -2100,7 +2115,10 @@ func ProcessListResult[T any](ctx context.Context, srcs []Source, out OutConfig,
 		readers := make([]io.Reader, 0, len(srcs))
 		var total int64
 		for _, src := range srcs {
-			r, size := s.UseSized(src)
+			r, size, err := s.UseSized(src)
+			if err != nil {
+				return nil, err
+			}
 			readers = append(readers, r)
 			if total >= 0 && size >= 0 {
 				total += size
@@ -2117,7 +2135,10 @@ func ProcessAt(ctx context.Context, src Source, out OutConfig, fn func(ra io.Rea
 		return nil, ErrNilFunc
 	}
 	return DoOut(ctx, out, func(ctx context.Context, s *OutScope, w io.Writer) error {
-		ra, size := s.UseReaderAt(src, opts...)
+		ra, size, err := s.UseReaderAt(src, opts...)
+		if err != nil {
+			return err
+		}
 		if ra == nil {
 			return ErrCannotGetReaderAt
 		}
@@ -2130,7 +2151,10 @@ func Read(ctx context.Context, src Source, fn func(r io.Reader) error) error {
 		return ErrNilFunc
 	}
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
-		r := s.Use(src)
+		r, rerr := s.Use(src)
+		if rerr != nil {
+			return nil, rerr
+		}
 		return nil, fn(r)
 	})
 	return err
@@ -2141,7 +2165,10 @@ func ReadResult[T any](ctx context.Context, src Source, fn func(r io.Reader) (*T
 		return nil, ErrNilFunc
 	}
 	return Do(ctx, func(s *Scope) (*T, error) {
-		r := s.Use(src)
+		r, rerr := s.Use(src)
+		if rerr != nil {
+			return nil, rerr
+		}
 		return fn(r)
 	})
 }
@@ -2151,7 +2178,10 @@ func ReadAt(ctx context.Context, src Source, fn func(ra io.ReaderAt, size int64)
 		return ErrNilFunc
 	}
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
-		ra, size := s.UseReaderAt(src, opts...)
+		ra, size, rerr := s.UseReaderAt(src, opts...)
+		if rerr != nil {
+			return nil, rerr
+		}
 		if ra == nil {
 			return nil, ErrCannotGetReaderAt
 		}
@@ -2165,7 +2195,10 @@ func ReadAtResult[T any](ctx context.Context, src Source, fn func(ra io.ReaderAt
 		return nil, ErrNilFunc
 	}
 	return Do(ctx, func(s *Scope) (*T, error) {
-		ra, size := s.UseReaderAt(src, opts...)
+		ra, size, rerr := s.UseReaderAt(src, opts...)
+		if rerr != nil {
+			return nil, rerr
+		}
 		if ra == nil {
 			return nil, ErrCannotGetReaderAt
 		}
@@ -2183,7 +2216,11 @@ func ReadList(ctx context.Context, srcs []Source, fn func(readers []io.Reader) e
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
 		readers := make([]io.Reader, 0, len(srcs))
 		for _, src := range srcs {
-			readers = append(readers, s.Use(src))
+			r, rerr := s.Use(src)
+			if rerr != nil {
+				return nil, rerr
+			}
+			readers = append(readers, r)
 		}
 		if err := fn(readers); err != nil {
 			return nil, err
@@ -2203,7 +2240,11 @@ func ReadListResult[T any](ctx context.Context, srcs []Source, fn func(readers [
 	return Do(ctx, func(s *Scope) (*T, error) {
 		readers := make([]io.Reader, 0, len(srcs))
 		for _, src := range srcs {
-			readers = append(readers, s.Use(src))
+			r, rerr := s.Use(src)
+			if rerr != nil {
+				return nil, rerr
+			}
+			readers = append(readers, r)
 		}
 		return fn(readers)
 	})
@@ -2378,7 +2419,10 @@ func ReadLines(ctx context.Context, src Source, fn LineFunc) error {
 	}
 
 	_, err := Do(ctx, func(s *Scope) (*Void, error) {
-		r := s.Use(src)
+		r, rerr := s.Use(src)
+		if rerr != nil {
+			return nil, rerr
+		}
 		scanner := bufio.NewScanner(r)
 		buf := make([]byte, 0, 64*1024)
 		scanner.Buffer(buf, 1024*1024)

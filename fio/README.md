@@ -231,7 +231,10 @@ size := result.Size()
 
 ```go
 result, err := fio.Do(ctx, func(s *fio.Scope) (MyResult, error) {
-    r := s.Use(fio.PathSource("input.txt"))  // Auto-cleanup on scope exit
+    r, err := s.Use(fio.PathSource("input.txt"))  // Auto-cleanup on scope exit
+    if err != nil {
+        return MyResult{}, err
+    }
     // Process r...
     return result, nil
 })
@@ -242,7 +245,10 @@ result, err := fio.Do(ctx, func(s *fio.Scope) (MyResult, error) {
 ```go
 output, err := fio.DoOut(ctx, fio.Out(".txt"),
     func(ctx context.Context, s *fio.OutScope, w io.Writer) error {
-        r := s.Use(fio.PathSource("input.txt"))
+        r, err := s.Use(fio.PathSource("input.txt"))
+        if err != nil {
+            return err
+        }
         _, err := io.Copy(w, r)
         return err
     })
@@ -253,7 +259,10 @@ output, err := fio.DoOut(ctx, fio.Out(".txt"),
 ```go
 output, metadata, err := fio.DoOutResult(ctx, fio.Out(".txt"),
     func(ctx context.Context, s *fio.OutScope, w io.Writer) (*Metadata, error) {
-        r, size := s.UseSized(fio.PathSource("input.txt"))
+        r, size, err := s.UseSized(fio.PathSource("input.txt"))
+        if err != nil {
+            return nil, err
+        }
         _, err := io.Copy(w, r)
         if err != nil {
             return nil, err
