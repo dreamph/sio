@@ -179,7 +179,7 @@ func TestReadAndResults(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 
 	var n int
-	err := Read[int](ctx, BytesSource([]byte("abc")), func(r io.Reader) error {
+	err := Read(ctx, BytesSource([]byte("abc")), func(r io.Reader) error {
 		b, err := io.ReadAll(r)
 		if err != nil {
 			return err
@@ -501,7 +501,7 @@ func TestMultipartSource(t *testing.T) {
 func TestErrorPaths(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 
-	if err := Read[int](ctx, BytesSource([]byte("x")), nil); !errors.Is(err, ErrNilFunc) {
+	if err := Read(ctx, BytesSource([]byte("x")), nil); !errors.Is(err, ErrNilFunc) {
 		t.Fatalf("Read nil fn: %v", err)
 	}
 	if _, err := Copy(ctx, nil, Out(".txt")); !errors.Is(err, ErrNilSource) {
